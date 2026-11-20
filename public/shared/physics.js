@@ -41,23 +41,40 @@ export function dashDistance(def, targetDist) {
   return Math.min(def.distance || 220, Math.max(90, targetDist));
 }
 
-// Samples a dash ('dash_strike' stops at the first obstacle; 'blink_strike' passes through them).
-// Returns every sampled point the dasher occupied (for hit checks) and the final resolved position.
-export function traceDash(kind, x, y, dirX, dirY, dist, radius) {
-  const steps = kind === 'blink_strike' ? 6 : 10;
+// Samples a dash that stops at the first obstacle. Returns every sampled point the dasher occupied
+// (for hit checks) and the final resolved position.
+export function traceDash(x, y, dirX, dirY, dist, radius) {
+  const steps = 10;
   const path = [];
   let cx = x;
   let cy = y;
   for (let i = 1; i <= steps; i++) {
     const tx = x + dirX * (dist * (i / steps));
     const ty = y + dirY * (dist * (i / steps));
-    if (hitsObstacle(tx, ty, radius - 2)) {
-      if (kind === 'dash_strike') break;
-      continue;
-    }
+    if (hitsObstacle(tx, ty, radius - 2)) break;
     cx = tx;
     cy = ty;
     path.push({ x: cx, y: cy });
   }
   return { path, end: resolveCircleObstacles(cx, cy, radius) };
+}
+
+// Contact normal for a circle touching the world border or an obstacle (null when free).
+// Used to reflect ricocheting projectiles.
+export function obstacleNormal(x, y, radius) {
+  if (x < MARGIN) return { nx: 1, ny: 0 };
+  if (x > WORLD_SIZE - MARGIN) return { nx: -1, ny: 0 };
+  if (y < MARGIN) return { nx: 0, ny: 1 };
+  if (y > WORLD_SIZE - MARGIN) return { nx: 0, ny: -1 };
+  for (const ob of OBSTACLES) {
+    const dx = x - ob.x;
+    const dy = y - ob.y;
+    const minD = radius + ob.r;
+    const d2 = dx * dx + dy * dy;
+    if (d2 < minD * minD) {
+      const d = Math.sqrt(d2) || 0.001;
+      return { nx: dx / d, ny: dy / d };
+    }
+  }
+  return null;
 }

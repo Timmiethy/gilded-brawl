@@ -8,7 +8,7 @@ import {
   SHRINE_SPOTS,
   PRACTICE_TOTEM_SPOTS,
 } from '../public/shared/map.js';
-import { MARGIN, resolveCircleObstacles, hitsObstacle, dashDistance, traceDash } from '../public/shared/physics.js';
+import { MARGIN, resolveCircleObstacles, obstacleNormal, dashDistance, traceDash } from '../public/shared/physics.js';
 
 const PLAYER_TIMEOUT_MS = 12_000;
 const RESPAWN_TIME_SEC = 4.0;
@@ -26,6 +26,8 @@ const MAX_PROJECTILES = 1024;
 const MAX_ZONES = 128;
 const MAX_DELAYED_BLASTS = 128;
 const MAX_EVENTS = 1024;
+// Trail points: Scalding Spill lasts 3s at hasted speed (210 × 1.38 ≈ 290 px/s) ≈ 870px / 18px ≈ 48 points.
+const MAX_TRAIL_POINTS = 96;
 
 // Movement budget: a client may bank up to this much unspent travel time (covers a 600ms network stall)
 // plus a fixed slack for server-side displacements (player separation, obstacle push-out).
@@ -64,6 +66,7 @@ function createInitialState() {
     phase: 'playing', // 'playing' | 'intermission'
     phaseEndAt: now + ROUND_DURATION_SEC * 1000,
     lastStepAt: now,
+    clock: now, // simulation time of the current step; every timestamp inside the sim uses it
     nextEntityId: 1,
     nextEventId: 1,
     nextPlayerNum: 1,
@@ -91,7 +94,7 @@ export function getState() {
 
 function pushEvent(state, evt) {
   evt.id = state.nextEventId++;
-  evt.t = Date.now();
+  evt.t = state.clock;
   state.events.push(evt);
   if (state.events.length > MAX_EVENTS) {
     state.events.splice(0, state.events.length - MAX_EVENTS);
@@ -121,12 +124,14 @@ function pickSpawn(state) {
   };
 }
 
-function getAllTargets(state, attackerId) {
+// visibleOnly: auto-aimed effects (homing, chains, turrets, lock-ons) cannot pick a stealthed player.
+// Area damage still lands on them — they are physically there.
+function getAllTargets(state, attackerId, visibleOnly = false) {
   const targets = [];
   for (const p of state.players.values()) {
-    if (p.id !== attackerId && p.alive) {
-      targets.push({ kind: 'player', ref: p, x: p.x, y: p.y, r: p.radius });
-    }
+    if (p.id === attackerId || !p.alive) continue;
+    if (visibleOnly && p.stealthTimer > 0) continue;
+    targets.push({ kind: 'player', ref: p, x: p.x, y: p.y, r: p.radius });
   }
   for (const t of state.totems) {
     if (t.alive) {
@@ -134,6 +139,20 @@ function getAllTargets(state, attackerId) {
     }
   }
   return targets;
+}
+
+function nearestTarget(state, attackerId, x, y, maxDist, exclude = null) {
+  let best = null;
+  let bestD = maxDist;
+  for (const tw of getAllTargets(state, attackerId, true)) {
+    if (exclude && exclude.has(tw.ref.id)) continue;
+    const d = Math.hypot(tw.x - x, tw.y - y);
+    if (d <= bestD) {
+      bestD = d;
+      best = tw;
+    }
+  }
+  return best;
 }
 
 function applyDamage(state, attacker, targetWrap, rawDamage, opts = {}) {
@@ -153,7 +172,7 @@ function applyDamage(state, attacker, targetWrap, rawDamage, opts = {}) {
     });
     if (t.hp <= 0) {
       t.alive = false;
-      t.respawnAt = Date.now() + 5000;
+      t.respawnAt = state.clock + 5000;
       pushEvent(state, { type: 'blast', x: t.x, y: t.y, r: 48, color: '#ffe082' });
     }
     // Practice totems are for testing combos: they grant no lifesteal, so they cannot be farmed for healing.
@@ -176,19 +195,16 @@ function applyDamage(state, attacker, targetWrap, rawDamage, opts = {}) {
     attacker.roundDamage += dmg;
     const lb = state.leaderboard.get(attacker.id);
     if (lb) lb.damage += dmg;
-    if (opts.lifesteal) {
-      healPlayer(state, attacker, opts.lifesteal);
-    }
+    if (opts.lifesteal) healPlayer(state, attacker, opts.lifesteal);
   }
 
   if (opts.knockback && opts.kx !== undefined && opts.ky !== undefined) {
     victim.kbx += opts.kx * opts.knockback;
     victim.kby += opts.ky * opts.knockback;
-    victim.forceSyncUntil = Date.now() + 350;
+    victim.forceSyncUntil = state.clock + 350;
   }
-  if (opts.slow) {
-    victim.slowTimer = Math.max(victim.slowTimer, opts.slow);
-  }
+  if (opts.slow) victim.slowTimer = Math.max(victim.slowTimer, opts.slow);
+  if (opts.silence) victim.silenceTimer = Math.max(victim.silenceTimer, opts.silence);
 
   pushEvent(state, {
     type: 'hit',
@@ -200,25 +216,33 @@ function applyDamage(state, attacker, targetWrap, rawDamage, opts = {}) {
     attackerId: attacker?.id || null,
   });
 
-  if (victim.hp <= 0) {
-    victim.alive = false;
-    victim.respawnTimer = RESPAWN_TIME_SEC;
-    victim.shield = 0;
-    victim.orbitTimer = 0;
-    if (attacker && attacker.id !== victim.id) {
-      attacker.roundKos += 1;
-      const lb = state.leaderboard.get(attacker.id);
-      if (lb) lb.kos += 1;
-    }
-    pushEvent(state, {
-      type: 'ko',
-      x: victim.x,
-      y: victim.y,
-      victimName: victim.name,
-      attackerName: attacker ? attacker.name : 'Arena',
-      color: victim.color,
-    });
+  if (victim.hp <= 0) killPlayer(state, victim, attacker);
+}
+
+function killPlayer(state, victim, attacker) {
+  victim.alive = false;
+  victim.respawnTimer = RESPAWN_TIME_SEC;
+  victim.shield = 0;
+  victim.orbitTimer = 0;
+  victim.stealthTimer = 0;
+  victim.trailTimer = 0;
+  victim.silenceTimer = 0;
+  victim.history = [];
+  if (attacker && attacker.id !== victim.id) {
+    attacker.roundKos += 1;
+    const lb = state.leaderboard.get(attacker.id);
+    if (lb) lb.kos += 1;
   }
+  pushEvent(state, {
+    type: 'ko',
+    x: victim.x,
+    y: victim.y,
+    victimId: victim.id,
+    victimName: victim.name,
+    attackerId: attacker ? attacker.id : null,
+    attackerName: attacker ? attacker.name : 'Arena',
+    color: victim.color,
+  });
 }
 
 function healPlayer(state, player, amount) {
@@ -227,14 +251,79 @@ function healPlayer(state, player, amount) {
   player.hp = Math.min(player.maxHp, Math.round(player.hp + amount));
   const actual = player.hp - before;
   if (actual > 0) {
-    pushEvent(state, {
-      type: 'heal',
-      x: player.x,
-      y: player.y - 22,
-      amount: actual,
-      targetId: player.id,
-    });
+    pushEvent(state, { type: 'heal', x: player.x, y: player.y - 22, amount: actual, targetId: player.id });
   }
+}
+
+function teleportPlayer(player, x, y) {
+  const r = resolveCircleObstacles(x, y, player.radius);
+  player.x = r.x;
+  player.y = r.y;
+  player.kbx = 0;
+  player.kby = 0;
+  player.forcedSeq += 1;
+}
+
+function addZone(state, zone) {
+  if (state.zones.length >= MAX_ZONES) {
+    warnBudget('MAX_ZONES', MAX_ZONES);
+    return null;
+  }
+  zone.id = state.nextEntityId++;
+  state.zones.push(zone);
+  return zone;
+}
+
+function addBlast(state, blast) {
+  if (state.delayedBlasts.length >= MAX_DELAYED_BLASTS) {
+    warnBudget('MAX_DELAYED_BLASTS', MAX_DELAYED_BLASTS);
+    return;
+  }
+  blast.id = state.nextEntityId++;
+  blast.totalDelay = blast.delay;
+  state.delayedBlasts.push(blast);
+}
+
+function spawnProjectile(state, player, def, angle, damage) {
+  if (state.projectiles.length >= MAX_PROJECTILES) {
+    warnBudget('MAX_PROJECTILES', MAX_PROJECTILES);
+    return;
+  }
+  const cx = Math.cos(angle);
+  const cy = Math.sin(angle);
+  const outLife = def.range / def.speed;
+  state.projectiles.push({
+    id: state.nextEntityId++,
+    ownerId: player.id,
+    visual: def.visual || 'orb',
+    x: player.x + cx * (player.radius + 8),
+    y: player.y + cy * (player.radius + 8),
+    vx: cx * def.speed,
+    vy: cy * def.speed,
+    speed: def.speed,
+    radius: def.radius || 8,
+    damage,
+    age: 0,
+    outLife,
+    // A boomerang may fly out and back; everything else lives for its range
+    life: def.returns ? outLife * 2.5 : outLife,
+    color: def.color,
+    pierce: !!def.pierce,
+    splash: def.splash || 0,
+    knockback: def.knockback || 0,
+    slow: def.slow || 0,
+    silence: def.silence || 0,
+    lifesteal: def.lifesteal || 0,
+    bounces: def.bounces || 0,
+    homing: def.homing || 0,
+    returns: !!def.returns,
+    returning: false,
+    onHit: def.onHit || null,
+    curseDelay: def.curseDelay || 1.5,
+    curseRadius: def.curseRadius || 110,
+    portalLockId: 0,
+    hitSet: new Set(),
+  });
 }
 
 function castAction(state, player, actionKey, aimX, aimY) {
@@ -245,6 +334,8 @@ function castAction(state, player, actionKey, aimX, aimY) {
   const isBasic = actionKey === 'basic';
   const skillIdx = actionKey === 'skill0' ? 0 : actionKey === 'skill1' ? 1 : actionKey === 'skill2' ? 2 : -1;
   if (!isBasic && skillIdx < 0) return;
+  // Silence blocks skills, not the basic attack
+  if (!isBasic && player.silenceTimer > 0) return;
 
   const def = isBasic ? charDef.basic : charDef.skills[skillIdx];
   const cdKey = isBasic ? 'basic' : `s${skillIdx}`;
@@ -253,6 +344,15 @@ function castAction(state, player, actionKey, aimX, aimY) {
   player.cooldowns[cdKey] = def.cooldown;
   player.attackAnim = 0.22;
 
+  // Attacking from stealth reveals you, and that first attack hits harder
+  let power = 1;
+  if (player.stealthTimer > 0 && def.type !== 'stealth') {
+    power = player.ambushMult || 1;
+    player.stealthTimer = 0;
+    pushEvent(state, { type: 'reveal', x: player.x, y: player.y, color: player.color });
+  }
+  const dmg = (def.damage || 0) * power;
+
   const dx = aimX - player.x;
   const dy = aimY - player.y;
   const angle = Math.atan2(dy, dx);
@@ -260,34 +360,18 @@ function castAction(state, player, actionKey, aimX, aimY) {
   const dirX = Math.cos(angle);
   const dirY = Math.sin(angle);
   const targetDist = Math.hypot(dx, dy);
+  const aimPoint = (maxRange, pad = 30) => {
+    const d = Math.min(targetDist, maxRange);
+    return {
+      x: clamp(player.x + dirX * d, MARGIN + pad, WORLD_SIZE - MARGIN - pad),
+      y: clamp(player.y + dirY * d, MARGIN + pad, WORLD_SIZE - MARGIN - pad),
+    };
+  };
+  if (def.speedBuff) player.speedBuffTimer = Math.max(player.speedBuffTimer, def.speedBuff);
 
   switch (def.type) {
-    case 'projectile':
-    case 'explosive_proj':
-    case 'hook': {
-      if (state.projectiles.length >= MAX_PROJECTILES) {
-        warnBudget('MAX_PROJECTILES', MAX_PROJECTILES);
-        break;
-      }
-      state.projectiles.push({
-        id: state.nextEntityId++,
-        ownerId: player.id,
-        kind: def.type,
-        x: player.x + dirX * (player.radius + 8),
-        y: player.y + dirY * (player.radius + 8),
-        vx: dirX * def.speed,
-        vy: dirY * def.speed,
-        radius: def.radius || 8,
-        damage: def.damage,
-        life: def.range / def.speed,
-        color: def.color,
-        pierce: !!def.pierce,
-        splash: def.splash || 0,
-        knockback: def.knockback || 0,
-        slow: def.slow || 0,
-        lifesteal: def.lifesteal || 0,
-        hitSet: new Set(),
-      });
+    case 'projectile': {
+      spawnProjectile(state, player, def, angle, dmg);
       pushEvent(state, { type: 'cast', x: player.x, y: player.y, sound: isBasic ? 'shoot' : 'skill', color: def.color });
       break;
     }
@@ -296,33 +380,8 @@ function castAction(state, player, actionKey, aimX, aimY) {
       const count = def.count || 3;
       const spread = def.spread || 0.4;
       for (let i = 0; i < count; i++) {
-        if (state.projectiles.length >= MAX_PROJECTILES) {
-          warnBudget('MAX_PROJECTILES', MAX_PROJECTILES);
-          break;
-        }
         const frac = count === 1 ? 0 : i / (count - 1) - 0.5;
-        const a = angle + frac * spread;
-        const cx = Math.cos(a);
-        const cy = Math.sin(a);
-        state.projectiles.push({
-          id: state.nextEntityId++,
-          ownerId: player.id,
-          kind: 'projectile',
-          x: player.x + cx * (player.radius + 8),
-          y: player.y + cy * (player.radius + 8),
-          vx: cx * def.speed,
-          vy: cy * def.speed,
-          radius: def.radius || 7,
-          damage: def.damage,
-          life: def.range / def.speed,
-          color: def.color,
-          pierce: !!def.pierce,
-          splash: 0,
-          knockback: def.knockback || 0,
-          slow: def.slow || 0,
-          lifesteal: def.lifesteal || 0,
-          hitSet: new Set(),
-        });
+        spawnProjectile(state, player, def, angle + frac * spread, dmg);
       }
       pushEvent(state, { type: 'cast', x: player.x, y: player.y, sound: 'spread', color: def.color });
       break;
@@ -334,19 +393,15 @@ function castAction(state, player, actionKey, aimX, aimY) {
       const halfArc = (def.arc || 1.4) / 2;
       for (const tw of getAllTargets(state, player.id)) {
         const d = Math.hypot(tw.x - player.x, tw.y - player.y);
-        if (d <= range + tw.r) {
-          const aTo = Math.atan2(tw.y - player.y, tw.x - player.x);
-          if (Math.abs(angleDiff(aTo, angle)) <= halfArc || d < player.radius + tw.r + 12) {
-            const nx = d > 0.01 ? (tw.x - player.x) / d : dirX;
-            const ny = d > 0.01 ? (tw.y - player.y) / d : dirY;
-            applyDamage(state, player, tw, def.damage, {
-              color: def.color,
-              knockback: def.knockback || 100,
-              kx: nx,
-              ky: ny,
-              lifesteal: def.lifesteal || 0,
-            });
-          }
+        if (d > range + tw.r) continue;
+        const aTo = Math.atan2(tw.y - player.y, tw.x - player.x);
+        if (Math.abs(angleDiff(aTo, angle)) <= halfArc || d < player.radius + tw.r + 12) {
+          applyDamage(state, player, tw, dmg, {
+            color: def.color,
+            knockback: def.knockback || 100,
+            kx: d > 0.01 ? (tw.x - player.x) / d : dirX,
+            ky: d > 0.01 ? (tw.y - player.y) / d : dirY,
+          });
         }
       }
       pushEvent(state, {
@@ -363,50 +418,31 @@ function castAction(state, player, actionKey, aimX, aimY) {
       break;
     }
 
-    case 'dash_strike':
-    case 'blink_strike': {
-      const dist = dashDistance(def, targetDist);
+    case 'dash_strike': {
       const startX = player.x;
       const startY = player.y;
-      const { path, end } = traceDash(def.type, startX, startY, dirX, dirY, dist, player.radius);
-
-      if (def.type === 'dash_strike') {
-        const hitIds = new Set();
-        for (const pt of path) {
-          for (const tw of getAllTargets(state, player.id)) {
-            const tid = tw.ref.id;
-            if (hitIds.has(tid)) continue;
-            if (Math.hypot(tw.x - pt.x, tw.y - pt.y) <= (def.radius || 44) + tw.r) {
-              hitIds.add(tid);
-              applyDamage(state, player, tw, def.damage, {
-                color: def.color,
-                knockback: def.knockback || 200,
-                kx: dirX,
-                ky: dirY,
-              });
-            }
+      const { path, end } = traceDash(startX, startY, dirX, dirY, dashDistance(def, targetDist), player.radius);
+      const hitIds = new Set();
+      for (const pt of path) {
+        for (const tw of getAllTargets(state, player.id)) {
+          if (hitIds.has(tw.ref.id)) continue;
+          if (Math.hypot(tw.x - pt.x, tw.y - pt.y) <= (def.radius || 44) + tw.r) {
+            hitIds.add(tw.ref.id);
+            applyDamage(state, player, tw, dmg, {
+              color: def.color,
+              knockback: def.knockback || 200,
+              kx: dirX,
+              ky: dirY,
+            });
           }
         }
       }
-
       player.x = end.x;
       player.y = end.y;
-      player.forcedSeq = (player.forcedSeq || 0) + 1;
-
-      if (def.type === 'blink_strike') {
-        for (const tw of getAllTargets(state, player.id)) {
-          if (Math.hypot(tw.x - player.x, tw.y - player.y) <= (def.radius || 75) + tw.r) {
-            applyDamage(state, player, tw, def.damage, { color: def.color });
-          }
-        }
-      }
-      if (def.speedBuff) {
-        player.speedBuffTimer = Math.max(player.speedBuffTimer, def.speedBuff);
-      }
+      player.forcedSeq += 1;
       pushEvent(state, {
         type: 'dash',
         actorId: player.id,
-        playerId: player.id,
         x1: startX,
         y1: startY,
         x2: player.x,
@@ -416,32 +452,46 @@ function castAction(state, player, actionKey, aimX, aimY) {
       break;
     }
 
-    case 'nova':
+    case 'blink_chain': {
+      const points = [{ x: player.x, y: player.y }];
+      const hit = new Set();
+      for (let h = 0; h < (def.hops || 3); h++) {
+        const tw = nearestTarget(state, player.id, player.x, player.y, def.range || 500, hit);
+        if (!tw) break;
+        hit.add(tw.ref.id);
+        const d = Math.hypot(tw.x - player.x, tw.y - player.y) || 1;
+        const back = player.radius + tw.r + 4;
+        teleportPlayer(player, tw.x - ((tw.x - player.x) / d) * back, tw.y - ((tw.y - player.y) / d) * back);
+        applyDamage(state, player, tw, dmg, { color: def.color });
+        points.push({ x: player.x, y: player.y });
+      }
+      if (points.length === 1) {
+        // Nobody in reach: refund most of the cooldown instead of wasting the ultimate
+        player.cooldowns[cdKey] = 0.5;
+        pushEvent(state, { type: 'fizzle', x: player.x, y: player.y, color: def.color });
+        break;
+      }
+      pushEvent(state, { type: 'blink_chain', actorId: player.id, points, color: def.color });
+      break;
+    }
+
     case 'shield_pulse':
     case 'heal_nova': {
       if (def.shield) {
         player.shield = Math.max(player.shield, def.shield);
         player.shieldTimer = def.duration || 4.0;
       }
-      if (def.heal) {
-        healPlayer(state, player, def.heal);
-      }
-      if (def.speedBuff) {
-        player.speedBuffTimer = Math.max(player.speedBuffTimer, def.speedBuff);
-      }
+      if (def.heal) healPlayer(state, player, def.heal);
       const r = def.radius || 140;
       for (const tw of getAllTargets(state, player.id)) {
         const d = Math.hypot(tw.x - player.x, tw.y - player.y);
         if (d <= r + tw.r) {
-          const nx = d > 0.01 ? (tw.x - player.x) / d : 1;
-          const ny = d > 0.01 ? (tw.y - player.y) / d : 0;
-          applyDamage(state, player, tw, def.damage, {
+          applyDamage(state, player, tw, dmg, {
             color: def.color,
             knockback: def.knockback || 0,
-            kx: nx,
-            ky: ny,
+            kx: d > 0.01 ? (tw.x - player.x) / d : 1,
+            ky: d > 0.01 ? (tw.y - player.y) / d : 0,
             slow: def.slow || 0,
-            lifesteal: def.lifesteal || 0,
           });
         }
       }
@@ -449,114 +499,221 @@ function castAction(state, player, actionKey, aimX, aimY) {
       break;
     }
 
-    case 'orbit_hounds': {
+    case 'orbit': {
       player.orbitTimer = def.duration || 4.5;
-      player.orbitDamage = def.damage || 9;
-      player.orbitRadius = def.orbitRadius || 72;
+      player.orbitDamage = dmg || 9;
+      player.orbitRadius = def.orbitRadius || 100;
+      player.orbitCount = def.orbitCount || 2;
+      player.orbitColor = def.color;
       player.orbitTick = 0;
-      pushEvent(state, { type: 'cast', x: player.x, y: player.y, sound: 'howl', color: def.color });
+      pushEvent(state, { type: 'cast', x: player.x, y: player.y, sound: 'skill', color: def.color });
+      break;
+    }
+
+    case 'stealth': {
+      player.stealthTimer = def.duration || 3;
+      player.ambushMult = def.ambush || 1;
+      pushEvent(state, { type: 'stealth', x: player.x, y: player.y, color: def.color });
+      break;
+    }
+
+    case 'rewind': {
+      const target = state.clock - (def.seconds || 2) * 1000;
+      const idx = player.history.findIndex((h) => h.t >= target);
+      if (idx < 0) break;
+      const from = player.history[idx];
+      // Afterimages along the path we unwind (every other sample keeps the event small)
+      const path = player.history.slice(idx).filter((_, i) => i % 2 === 0).map((h) => ({ x: h.x, y: h.y }));
+      path.push({ x: player.x, y: player.y });
+      teleportPlayer(player, from.x, from.y);
+      if (from.hp > player.hp) healPlayer(state, player, Math.min(player.maxHp, from.hp) - player.hp);
+      player.history = [];
+      pushEvent(state, { type: 'rewind', actorId: player.id, path, x: player.x, y: player.y, color: def.color });
       break;
     }
 
     case 'zone':
     case 'turret': {
-      if (state.zones.length >= MAX_ZONES) {
-        warnBudget('MAX_ZONES', MAX_ZONES);
-        break;
-      }
-      const clampedDist = Math.min(targetDist, def.range || 350);
-      const zx = clamp(player.x + dirX * clampedDist, MARGIN + 30, WORLD_SIZE - MARGIN - 30);
-      const zy = clamp(player.y + dirY * clampedDist, MARGIN + 30, WORLD_SIZE - MARGIN - 30);
-      state.zones.push({
-        id: state.nextEntityId++,
+      const at = aimPoint(def.range || 350);
+      addZone(state, {
         ownerId: player.id,
         kind: def.type,
-        x: zx,
-        y: zy,
+        visual: def.visual || def.type,
+        x: at.x,
+        y: at.y,
         radius: def.radius || 90,
-        damage: def.damage,
+        damage: dmg,
         remaining: def.duration || 3.5,
+        duration: def.duration || 3.5,
         tickRate: def.tickRate || 0.6,
         tickTimer: 0.08,
         slow: def.slow || 0,
         pull: def.pull || 0,
+        silence: def.silence || 0,
+        projSlow: def.projSlow || 0,
+        barrier: !!def.barrier,
         color: def.color,
       });
-      pushEvent(state, { type: 'cast', x: zx, y: zy, sound: 'zone', color: def.color });
+      pushEvent(state, { type: 'cast', x: at.x, y: at.y, sound: 'zone', color: def.color });
+      break;
+    }
+
+    case 'portal': {
+      const at = aimPoint(def.range || 700);
+      const exit = resolveCircleObstacles(at.x, at.y, 20);
+      const z = addZone(state, {
+        ownerId: player.id,
+        kind: 'portal',
+        visual: 'portal',
+        x: player.x,
+        y: player.y,
+        bx: exit.x,
+        by: exit.y,
+        radius: def.radius || 34,
+        remaining: def.duration || 6,
+        duration: def.duration || 6,
+        color: def.color,
+      });
+      // The caster stands in the entrance: they must step out before it can take them
+      if (z) player.portalLockId = z.id;
+      pushEvent(state, { type: 'portal_open', x1: player.x, y1: player.y, x2: exit.x, y2: exit.y, color: def.color });
+      break;
+    }
+
+    case 'trail': {
+      const z = addZone(state, {
+        ownerId: player.id,
+        kind: 'trail',
+        visual: 'trail',
+        x: player.x,
+        y: player.y,
+        points: [{ x: player.x, y: player.y, until: state.clock + (def.linger || 2) * 1000 }],
+        linger: def.linger || 2,
+        radius: def.radius || 32,
+        damage: dmg,
+        remaining: (def.duration || 3) + (def.linger || 2),
+        duration: (def.duration || 3) + (def.linger || 2),
+        tickRate: def.tickRate || 0.4,
+        tickTimer: 0.1,
+        slow: def.slow || 0,
+        color: def.color,
+      });
+      if (z) {
+        player.trailTimer = def.duration || 3;
+        player.trailZoneId = z.id;
+      }
+      pushEvent(state, { type: 'cast', x: player.x, y: player.y, sound: 'skill', color: def.color });
+      break;
+    }
+
+    case 'ripple': {
+      addZone(state, {
+        ownerId: player.id,
+        kind: 'ripple',
+        x: player.x,
+        y: player.y,
+        radius: def.radius || 360,
+        age: 0,
+        duration: def.duration || 0.7,
+        remaining: def.duration || 0.7,
+        damage: dmg,
+        knockback: def.knockback || 0,
+        slow: def.slow || 0,
+        silence: def.silence || 0,
+        color: def.color,
+        hitSet: new Set(),
+      });
+      pushEvent(state, {
+        type: 'ripple',
+        actorId: player.id,
+        x: player.x,
+        y: player.y,
+        r: def.radius || 360,
+        duration: def.duration || 0.7,
+        color: def.color,
+      });
       break;
     }
 
     case 'delayed_blast': {
-      if (state.delayedBlasts.length >= MAX_DELAYED_BLASTS) {
-        warnBudget('MAX_DELAYED_BLASTS', MAX_DELAYED_BLASTS);
-        break;
+      const center = aimPoint(def.range || 400);
+      const count = def.count || 1;
+      for (let i = 0; i < count; i++) {
+        const a = Math.random() * Math.PI * 2;
+        const rr = i === 0 ? 0 : Math.sqrt(Math.random()) * (def.scatter || 0);
+        addBlast(state, {
+          kind: 'blast',
+          visual: def.visual || null,
+          ownerId: player.id,
+          x: clamp(center.x + Math.cos(a) * rr, MARGIN + 30, WORLD_SIZE - MARGIN - 30),
+          y: clamp(center.y + Math.sin(a) * rr, MARGIN + 30, WORLD_SIZE - MARGIN - 30),
+          radius: def.radius || 85,
+          damage: dmg,
+          delay: (def.delay || 0.45) + i * (def.stagger || 0),
+          slow: def.slow || 0,
+          knockback: def.knockback || 0,
+          color: def.color,
+        });
       }
-      const clampedDist = Math.min(targetDist, def.range || 400);
-      const bx = clamp(player.x + dirX * clampedDist, MARGIN + 30, WORLD_SIZE - MARGIN - 30);
-      const by = clamp(player.y + dirY * clampedDist, MARGIN + 30, WORLD_SIZE - MARGIN - 30);
-      state.delayedBlasts.push({
-        id: state.nextEntityId++,
+      pushEvent(state, { type: 'cast', x: center.x, y: center.y, sound: 'charge', color: def.color });
+      break;
+    }
+
+    case 'deadeye': {
+      const halfArc = (def.arc || 2) / 2;
+      const targetIds = [];
+      for (const tw of getAllTargets(state, player.id, true)) {
+        if (tw.kind !== 'player') continue;
+        const d = Math.hypot(tw.x - player.x, tw.y - player.y);
+        const aTo = Math.atan2(tw.y - player.y, tw.x - player.x);
+        if (d <= def.range && Math.abs(angleDiff(aTo, angle)) <= halfArc) targetIds.push(tw.ref.id);
+      }
+      addBlast(state, {
+        kind: 'deadeye',
         ownerId: player.id,
-        x: bx,
-        y: by,
-        radius: def.radius || 85,
-        damage: def.damage,
-        delay: def.delay || 0.45,
-        totalDelay: def.delay || 0.45,
-        slow: def.slow || 0,
-        knockback: def.knockback || 0,
+        x: player.x,
+        y: player.y,
+        radius: 0,
+        damage: dmg,
+        delay: def.delay || 0.8,
+        range: def.range,
+        targetIds,
         color: def.color,
       });
-      pushEvent(state, { type: 'cast', x: bx, y: by, sound: 'charge', color: def.color });
+      pushEvent(state, { type: 'deadeye', actorId: player.id, targetIds, x: player.x, y: player.y, color: def.color });
       break;
     }
 
     case 'chain_lightning': {
-      const targets = getAllTargets(state, player.id);
       const hitSet = new Set();
       let curX = player.x;
       let curY = player.y;
       const segments = [];
-      let bounces = def.bounces || 3;
-
-      // First target closest to aim ray within range
-      while (bounces > 0) {
+      for (let bounce = 0; bounce < (def.bounces || 3); bounce++) {
         let best = null;
         let bestScore = Infinity;
-        for (const tw of targets) {
+        const maxR = segments.length === 0 ? def.range || 640 : 420;
+        for (const tw of getAllTargets(state, player.id, true)) {
           if (hitSet.has(tw.ref.id)) continue;
           const d = Math.hypot(tw.x - curX, tw.y - curY);
-          const maxR = segments.length === 0 ? def.range || 680 : 420;
-          if (d <= maxR) {
-            let score = d;
-            if (segments.length === 0) {
-              const aTo = Math.atan2(tw.y - curY, tw.x - curX);
-              score += Math.abs(angleDiff(aTo, angle)) * 160;
-            }
-            if (score < bestScore) {
-              bestScore = score;
-              best = tw;
-            }
+          if (d > maxR) continue;
+          // The first strike prefers targets close to the aim ray
+          const score =
+            segments.length === 0 ? d + Math.abs(angleDiff(Math.atan2(tw.y - curY, tw.x - curX), angle)) * 160 : d;
+          if (score < bestScore) {
+            bestScore = score;
+            best = tw;
           }
         }
         if (!best) break;
         hitSet.add(best.ref.id);
         segments.push({ x1: curX, y1: curY, x2: best.x, y2: best.y });
-        applyDamage(state, player, best, def.damage * (segments.length === 1 ? 1 : 0.78), {
-          color: def.color,
-        });
+        applyDamage(state, player, best, dmg * (segments.length === 1 ? 1 : 0.78), { color: def.color });
         curX = best.x;
         curY = best.y;
-        bounces--;
       }
-
       if (segments.length === 0) {
-        segments.push({
-          x1: player.x,
-          y1: player.y,
-          x2: player.x + dirX * 440,
-          y2: player.y + dirY * 440,
-        });
+        segments.push({ x1: player.x, y1: player.y, x2: player.x + dirX * 440, y2: player.y + dirY * 440 });
       }
       pushEvent(state, { type: 'lightning', actorId: player.id, segments, color: def.color });
       break;
@@ -567,18 +724,14 @@ function castAction(state, player, actionKey, aimX, aimY) {
       const halfW = (def.width || 40) / 2;
       const endX = clamp(player.x + dirX * range, MARGIN, WORLD_SIZE - MARGIN);
       const endY = clamp(player.y + dirY * range, MARGIN, WORLD_SIZE - MARGIN);
+      const vx = endX - player.x;
+      const vy = endY - player.y;
+      const len2 = vx * vx + vy * vy || 1;
       for (const tw of getAllTargets(state, player.id)) {
         // Point-to-segment distance
-        const vx = endX - player.x;
-        const vy = endY - player.y;
-        const len2 = vx * vx + vy * vy || 1;
         const t = clamp(((tw.x - player.x) * vx + (tw.y - player.y) * vy) / len2, 0, 1);
-        const px = player.x + t * vx;
-        const py = player.y + t * vy;
-        const d = Math.hypot(tw.x - px, tw.y - py);
-        if (d <= halfW + tw.r) {
-          applyDamage(state, player, tw, def.damage, { color: def.color });
-        }
+        const d = Math.hypot(tw.x - (player.x + t * vx), tw.y - (player.y + t * vy));
+        if (d <= halfW + tw.r) applyDamage(state, player, tw, dmg, { color: def.color });
       }
       pushEvent(state, {
         type: 'beam',
@@ -646,7 +799,11 @@ function finishRound(state, now) {
   state.phase = 'intermission';
   state.phaseEndAt = now + INTERMISSION_SEC * 1000;
   // All combat stops at the bell: hounds must not keep biting through the intermission.
-  for (const p of state.players.values()) p.orbitTimer = 0;
+  for (const p of state.players.values()) {
+    p.orbitTimer = 0;
+    p.trailTimer = 0;
+    p.stealthTimer = 0;
+  }
   state.projectiles = [];
   state.zones = [];
   state.delayedBlasts = [];
@@ -692,6 +849,11 @@ function startNextRound(state, now) {
     p.slowTimer = 0;
     p.speedBuffTimer = 0;
     p.orbitTimer = 0;
+    p.silenceTimer = 0;
+    p.stealthTimer = 0;
+    p.trailTimer = 0;
+    p.portalLockId = 0;
+    p.history = [];
     p.kbx = 0;
     p.kby = 0;
     p.roundDamage = 0;
@@ -706,6 +868,7 @@ export function stepEngine(now = Date.now()) {
   const state = getState();
   const elapsedMs = now - state.lastStepAt;
   if (elapsedMs <= 0) return state;
+  state.clock = now;
 
   // Prune disconnected players
   for (const [id, p] of state.players.entries()) {
@@ -747,6 +910,8 @@ function stepPhysics(state, dt, now) {
     }
   }
 
+  const zonesById = new Map(state.zones.map((z) => [z.id, z]));
+
   // Players movement, cooldowns, status effects
   for (const p of state.players.values()) {
     if (p.hitFlash > 0) p.hitFlash = Math.max(0, p.hitFlash - dt);
@@ -762,13 +927,16 @@ function stepPhysics(state, dt, now) {
         const sp = pickSpawn(state);
         p.x = sp.x;
         p.y = sp.y;
-        p.forcedSeq = (p.forcedSeq || 0) + 1;
+        p.forcedSeq += 1;
         p.hp = Math.round(p.maxHp * 0.65);
         p.alive = true;
         p.kbx = 0;
         p.kby = 0;
         p.slowTimer = 0;
+        p.silenceTimer = 0;
         p.shield = 0;
+        p.history = [];
+        pushEvent(state, { type: 'respawn', playerId: p.id, x: p.x, y: p.y, color: p.color });
       }
       continue;
     }
@@ -779,26 +947,49 @@ function stepPhysics(state, dt, now) {
     }
     if (p.slowTimer > 0) p.slowTimer = Math.max(0, p.slowTimer - dt);
     if (p.speedBuffTimer > 0) p.speedBuffTimer = Math.max(0, p.speedBuffTimer - dt);
+    if (p.silenceTimer > 0) p.silenceTimer = Math.max(0, p.silenceTimer - dt);
+    if (p.stealthTimer > 0) {
+      p.stealthTimer = Math.max(0, p.stealthTimer - dt);
+      if (p.stealthTimer === 0) pushEvent(state, { type: 'reveal', x: p.x, y: p.y, color: p.color });
+    }
 
-    // Orbiting spectral hounds (Tibo skill E)
+    // Rewind history: one sample every 0.1s, 3.5s deep (Rewind looks back at most 2s)
+    p.historyTick -= dt;
+    if (p.historyTick <= 0) {
+      p.historyTick = 0.1;
+      p.history.push({ t: now, x: p.x, y: p.y, hp: p.hp });
+      while (p.history.length && p.history[0].t < now - 3500) p.history.shift();
+    }
+
+    // Scalding trail: drop a point every 18px travelled
+    if (p.trailTimer > 0) {
+      p.trailTimer = Math.max(0, p.trailTimer - dt);
+      const z = zonesById.get(p.trailZoneId);
+      if (z) {
+        const last = z.points[z.points.length - 1];
+        if ((!last || Math.hypot(p.x - last.x, p.y - last.y) >= 18) && z.points.length < MAX_TRAIL_POINTS) {
+          z.points.push({ x: p.x, y: p.y, until: now + z.linger * 1000 });
+        }
+      }
+    }
+
+    // Orbiting storm orbs
     if (p.orbitTimer > 0) {
       p.orbitTimer = Math.max(0, p.orbitTimer - dt);
-      p.orbitAngle = (p.orbitAngle || 0) + dt * 5.2;
+      p.orbitAngle = (p.orbitAngle || 0) + dt * 4.2;
       p.orbitTick = (p.orbitTick || 0) - dt;
       if (p.orbitTick <= 0) {
         p.orbitTick = 0.45;
-        const r = p.orbitRadius || 72;
         for (const tw of getAllTargets(state, p.id)) {
-          if (Math.hypot(tw.x - p.x, tw.y - p.y) <= r + tw.r + 16) {
-            applyDamage(state, p, tw, p.orbitDamage || 9, { color: '#fff59d' });
+          if (Math.hypot(tw.x - p.x, tw.y - p.y) <= p.orbitRadius + tw.r + 16) {
+            applyDamage(state, p, tw, p.orbitDamage, { color: p.orbitColor });
           }
         }
       }
     }
 
     if (state.phase === 'playing') {
-      const hasKnockback = Math.hypot(p.kbx, p.kby) > 4;
-      if (hasKnockback) {
+      if (Math.hypot(p.kbx, p.kby) > 4) {
         const nextPos = resolveCircleObstacles(p.x + p.kbx * dt, p.y + p.kby * dt, p.radius);
         p.x = nextPos.x;
         p.y = nextPos.y;
@@ -837,12 +1028,8 @@ function stepPhysics(state, dt, now) {
         const overlap = (minD - d) * 0.5;
         const ux = dx / d;
         const uy = dy / d;
-        a.x -= ux * overlap;
-        a.y -= uy * overlap;
-        b.x += ux * overlap;
-        b.y += uy * overlap;
-        const ra = resolveCircleObstacles(a.x, a.y, a.radius);
-        const rb = resolveCircleObstacles(b.x, b.y, b.radius);
+        const ra = resolveCircleObstacles(a.x - ux * overlap, a.y - uy * overlap, a.radius);
+        const rb = resolveCircleObstacles(b.x + ux * overlap, b.y + uy * overlap, b.radius);
         a.x = ra.x;
         a.y = ra.y;
         b.x = rb.x;
@@ -851,161 +1038,369 @@ function stepPhysics(state, dt, now) {
     }
   }
 
-  // Projectiles
-  const nextProjs = [];
+  stepProjectiles(state, dt);
+  stepZones(state, dt, now);
+  stepBlasts(state, dt);
+}
+
+// A portal pair moves anything inside one end to the other. `lock` remembers the portal an entity just
+// used, so it is not bounced straight back; the lock clears once the entity is outside both ends.
+function portalTransfer(z, ent, entRadius) {
+  const inA = distSq(ent.x, ent.y, z.x, z.y) < (z.radius + entRadius * 0.3) ** 2;
+  const inB = distSq(ent.x, ent.y, z.bx, z.by) < (z.radius + entRadius * 0.3) ** 2;
+  if (ent.portalLockId === z.id) {
+    if (!inA && !inB) ent.portalLockId = 0;
+    return null;
+  }
+  if (!inA && !inB) return null;
+  ent.portalLockId = z.id;
+  return inA ? { x: z.bx, y: z.by } : { x: z.x, y: z.y };
+}
+
+function stepProjectiles(state, dt) {
+  const portals = state.zones.filter((z) => z.kind === 'portal');
+  const stasis = state.zones.filter((z) => z.projSlow > 0);
+  const barriers = state.zones.filter((z) => z.barrier);
+
+  const next = [];
   for (const pr of state.projectiles) {
-    pr.x += pr.vx * dt;
-    pr.y += pr.vy * dt;
-    pr.life -= dt;
-
-    let dead = pr.life <= 0 || hitsObstacle(pr.x, pr.y, pr.radius);
+    // Enemy stasis bubbles slow the projectile's clock (it moves and ages slower inside)
+    let factor = 1;
+    for (const z of stasis) {
+      if (z.ownerId !== pr.ownerId && distSq(pr.x, pr.y, z.x, z.y) <= z.radius * z.radius) {
+        factor = Math.min(factor, z.projSlow);
+      }
+    }
+    const pdt = dt * factor;
     const owner = state.players.get(pr.ownerId);
+    pr.age += pdt;
+    pr.life -= pdt;
 
+    let dead = pr.life <= 0;
+    let fizzled = false;
+
+    if (pr.returns && !pr.returning && pr.age >= pr.outLife) {
+      pr.returning = true;
+      pr.hitSet.clear();
+    }
+    if (pr.returning) {
+      if (!owner || !owner.alive) {
+        dead = true;
+        fizzled = true;
+      } else {
+        const d = Math.hypot(owner.x - pr.x, owner.y - pr.y) || 1;
+        pr.vx = ((owner.x - pr.x) / d) * pr.speed;
+        pr.vy = ((owner.y - pr.y) / d) * pr.speed;
+      }
+    } else if (pr.homing > 0) {
+      const tgt = nearestTarget(state, pr.ownerId, pr.x, pr.y, 520);
+      if (tgt) {
+        const cur = Math.atan2(pr.vy, pr.vx);
+        const turn = clamp(angleDiff(Math.atan2(tgt.y - pr.y, tgt.x - pr.x), cur), -pr.homing * pdt, pr.homing * pdt);
+        pr.vx = Math.cos(cur + turn) * pr.speed;
+        pr.vy = Math.sin(cur + turn) * pr.speed;
+      }
+    }
+
+    pr.x += pr.vx * pdt;
+    pr.y += pr.vy * pdt;
+
+    // A returning boomerang is caught by its owner
+    if (!dead && pr.returning && owner && Math.hypot(owner.x - pr.x, owner.y - pr.y) < owner.radius + pr.radius) {
+      dead = true;
+      fizzled = true;
+    }
+
+    // Walls & obstacles
     if (!dead) {
-      for (const tw of getAllTargets(state, pr.ownerId)) {
-        if (pr.hitSet.has(tw.ref.id)) continue;
-        if (distSq(pr.x, pr.y, tw.x, tw.y) <= (pr.radius + tw.r) ** 2) {
-          pr.hitSet.add(tw.ref.id);
-          const vLen = Math.hypot(pr.vx, pr.vy) || 1;
-          if (pr.kind === 'hook' && owner && tw.kind === 'player') {
-            // Yank enemy toward owner
-            const dx = owner.x - tw.x;
-            const dy = owner.y - tw.y;
-            const d = Math.hypot(dx, dy) || 1;
-            const pullD = Math.max(0, d - 68);
-            const dest = resolveCircleObstacles(tw.x + (dx / d) * pullD, tw.y + (dy / d) * pullD, tw.r);
-            tw.ref.x = dest.x;
-            tw.ref.y = dest.y;
-            tw.ref.forcedSeq = (tw.ref.forcedSeq || 0) + 1;
-            applyDamage(state, owner, tw, pr.damage, { color: pr.color, slow: 1.0 });
-            pushEvent(state, { type: 'dash', x1: tw.x, y1: tw.y, x2: dest.x, y2: dest.y, color: pr.color });
-          } else {
-            applyDamage(state, owner, tw, pr.damage, {
-              color: pr.color,
-              knockback: pr.knockback,
-              kx: pr.vx / vLen,
-              ky: pr.vy / vLen,
-              slow: pr.slow,
-              lifesteal: pr.lifesteal,
-            });
+      const n = obstacleNormal(pr.x, pr.y, pr.radius);
+      if (n) {
+        if (pr.onHit === 'grapple' && owner && owner.alive) {
+          const d = Math.hypot(pr.vx, pr.vy) || 1;
+          const back = owner.radius + pr.radius + 6;
+          const x1 = owner.x;
+          const y1 = owner.y;
+          teleportPlayer(owner, pr.x - (pr.vx / d) * back, pr.y - (pr.vy / d) * back);
+          pushEvent(state, { type: 'dash', x1, y1, x2: owner.x, y2: owner.y, color: pr.color });
+          dead = true;
+          fizzled = true;
+        } else if (pr.bounces > 0 || (pr.returns && !pr.returning)) {
+          const dot = pr.vx * n.nx + pr.vy * n.ny;
+          if (dot < 0) {
+            pr.vx -= 2 * dot * n.nx;
+            pr.vy -= 2 * dot * n.ny;
           }
-          if (!pr.pierce) {
-            dead = true;
-            break;
-          }
+          const out = resolveCircleObstacles(pr.x, pr.y, pr.radius);
+          pr.x = out.x;
+          pr.y = out.y;
+          if (pr.bounces > 0) pr.bounces -= 1;
+          else pr.returning = true;
+          pr.hitSet.clear();
+          pushEvent(state, { type: 'bounce', x: pr.x, y: pr.y, color: pr.color });
+        } else {
+          dead = true;
         }
       }
     }
 
-    if (dead && pr.splash > 0) {
+    // Enemy barrier domes delete the shot
+    if (!dead) {
+      for (const z of barriers) {
+        if (z.ownerId !== pr.ownerId && distSq(pr.x, pr.y, z.x, z.y) <= z.radius * z.radius) {
+          dead = true;
+          fizzled = true;
+          pushEvent(state, { type: 'fizzle', x: pr.x, y: pr.y, color: z.color });
+          break;
+        }
+      }
+    }
+
+    // Portals carry shots too
+    if (!dead) {
+      for (const z of portals) {
+        const to = portalTransfer(z, pr, pr.radius);
+        if (to) {
+          pr.x = to.x;
+          pr.y = to.y;
+          break;
+        }
+      }
+    }
+
+    if (!dead) {
+      for (const tw of getAllTargets(state, pr.ownerId)) {
+        if (pr.hitSet.has(tw.ref.id)) continue;
+        if (distSq(pr.x, pr.y, tw.x, tw.y) > (pr.radius + tw.r) ** 2) continue;
+        pr.hitSet.add(tw.ref.id);
+        onProjectileHit(state, pr, owner, tw);
+        if (pr.onHit === 'curse') fizzled = true; // the bomb does the damage, not a splash
+        if (!pr.pierce) {
+          dead = true;
+          break;
+        }
+      }
+    }
+
+    if (dead && pr.splash > 0 && !fizzled) {
       for (const tw of getAllTargets(state, pr.ownerId)) {
         if (pr.hitSet.has(tw.ref.id)) continue;
         const d = Math.hypot(tw.x - pr.x, tw.y - pr.y);
         if (d <= pr.splash + tw.r) {
-          const nx = d > 0.01 ? (tw.x - pr.x) / d : 1;
-          const ny = d > 0.01 ? (tw.y - pr.y) / d : 0;
           applyDamage(state, owner, tw, pr.damage * 0.75, {
             color: pr.color,
             knockback: pr.knockback * 0.8,
-            kx: nx,
-            ky: ny,
+            kx: d > 0.01 ? (tw.x - pr.x) / d : 1,
+            ky: d > 0.01 ? (tw.y - pr.y) / d : 0,
           });
         }
       }
       pushEvent(state, { type: 'blast', x: pr.x, y: pr.y, r: pr.splash, color: pr.color });
     }
 
-    if (!dead) nextProjs.push(pr);
+    if (!dead) next.push(pr);
   }
-  state.projectiles = nextProjs;
+  state.projectiles = next;
+}
 
-  // Zones & Turrets
-  const nextZones = [];
+function onProjectileHit(state, pr, owner, tw) {
+  const isPlayer = tw.kind === 'player';
+  const canAct = owner && owner.alive;
+  if (pr.onHit === 'curse') {
+    addBlast(state, {
+      kind: 'bomb',
+      ownerId: pr.ownerId,
+      attachId: isPlayer ? tw.ref.id : null,
+      x: tw.x,
+      y: tw.y,
+      radius: pr.curseRadius,
+      damage: pr.damage,
+      delay: pr.curseDelay,
+      knockback: 160,
+      color: pr.color,
+    });
+    pushEvent(state, { type: 'cursed', x: tw.x, y: tw.y, targetId: tw.ref.id, color: pr.color });
+    return;
+  }
+  if (pr.onHit === 'hook' && canAct && isPlayer) {
+    const dx = owner.x - tw.x;
+    const dy = owner.y - tw.y;
+    const d = Math.hypot(dx, dy) || 1;
+    const pullD = Math.max(0, d - 68);
+    teleportPlayer(tw.ref, tw.x + (dx / d) * pullD, tw.y + (dy / d) * pullD);
+    applyDamage(state, owner, tw, pr.damage, { color: pr.color, slow: 1.0 });
+    pushEvent(state, { type: 'dash', x1: tw.x, y1: tw.y, x2: tw.ref.x, y2: tw.ref.y, color: pr.color });
+    return;
+  }
+  if (pr.onHit === 'swap' && canAct && isPlayer) {
+    const ox = owner.x;
+    const oy = owner.y;
+    teleportPlayer(owner, tw.ref.x, tw.ref.y);
+    teleportPlayer(tw.ref, ox, oy);
+    applyDamage(state, owner, tw, pr.damage, { color: pr.color });
+    pushEvent(state, { type: 'swap', x1: ox, y1: oy, x2: owner.x, y2: owner.y, color: pr.color });
+    return;
+  }
+  if (pr.onHit === 'grapple' && canAct) {
+    const d = Math.hypot(tw.x - owner.x, tw.y - owner.y) || 1;
+    const back = owner.radius + tw.r + 4;
+    const x1 = owner.x;
+    const y1 = owner.y;
+    teleportPlayer(owner, tw.x - ((tw.x - owner.x) / d) * back, tw.y - ((tw.y - owner.y) / d) * back);
+    applyDamage(state, owner, tw, pr.damage, { color: pr.color });
+    pushEvent(state, { type: 'dash', x1, y1, x2: owner.x, y2: owner.y, color: pr.color });
+    return;
+  }
+  const vLen = Math.hypot(pr.vx, pr.vy) || 1;
+  applyDamage(state, owner, tw, pr.damage, {
+    color: pr.color,
+    knockback: pr.knockback,
+    kx: pr.vx / vLen,
+    ky: pr.vy / vLen,
+    slow: pr.slow,
+    silence: pr.silence,
+    lifesteal: pr.lifesteal,
+  });
+}
+
+function stepZones(state, dt, now) {
+  const next = [];
   for (const z of state.zones) {
     z.remaining -= dt;
-    z.tickTimer -= dt;
     const owner = state.players.get(z.ownerId);
 
-    // Continuous gravity pull
-    if (z.pull > 0) {
+    if (z.kind === 'portal') {
+      for (const p of state.players.values()) {
+        if (!p.alive) continue;
+        const to = portalTransfer(z, p, p.radius);
+        if (to) {
+          const x1 = p.x;
+          const y1 = p.y;
+          teleportPlayer(p, to.x, to.y);
+          pushEvent(state, { type: 'portal', x1, y1, x2: p.x, y2: p.y, color: z.color });
+        }
+      }
+    } else if (z.kind === 'ripple') {
+      z.age += dt;
+      const r = z.radius * Math.min(1, z.age / z.duration);
       for (const tw of getAllTargets(state, z.ownerId)) {
-        if (tw.kind !== 'player') continue;
-        const dx = z.x - tw.x;
-        const dy = z.y - tw.y;
-        const d = Math.hypot(dx, dy);
-        if (d > 14 && d <= z.radius + tw.r) {
-          const dest = resolveCircleObstacles(
-            tw.ref.x + (dx / d) * z.pull * dt,
-            tw.ref.y + (dy / d) * z.pull * dt,
-            tw.r
-          );
-          tw.ref.x = dest.x;
-          tw.ref.y = dest.y;
-          tw.ref.forceSyncUntil = now + 200;
-        }
+        if (z.hitSet.has(tw.ref.id)) continue;
+        const d = Math.hypot(tw.x - z.x, tw.y - z.y);
+        if (d > r + tw.r) continue;
+        z.hitSet.add(tw.ref.id);
+        applyDamage(state, owner, tw, z.damage, {
+          color: z.color,
+          knockback: z.knockback,
+          kx: d > 0.01 ? (tw.x - z.x) / d : 1,
+          ky: d > 0.01 ? (tw.y - z.y) / d : 0,
+          slow: z.slow,
+          silence: z.silence,
+        });
       }
-    }
-
-    if (z.tickTimer <= 0) {
-      z.tickTimer = z.tickRate;
-      if (z.kind === 'turret') {
-        // Zap nearest target in range
-        let nearest = null;
-        let minD = z.radius;
-        for (const tw of getAllTargets(state, z.ownerId)) {
-          const d = Math.hypot(tw.x - z.x, tw.y - z.y);
-          if (d <= minD) {
-            minD = d;
-            nearest = tw;
-          }
-        }
-        if (nearest) {
-          applyDamage(state, owner, nearest, z.damage, { color: z.color });
-          pushEvent(state, {
-            type: 'lightning',
-            segments: [{ x1: z.x, y1: z.y - 12, x2: nearest.x, y2: nearest.y }],
-            color: z.color,
-          });
-        }
-      } else {
-        for (const tw of getAllTargets(state, z.ownerId)) {
-          if (Math.hypot(tw.x - z.x, tw.y - z.y) <= z.radius + tw.r) {
-            applyDamage(state, owner, tw, z.damage, { color: z.color, slow: z.slow });
-          }
-        }
-      }
-    }
-
-    if (z.remaining > 0) nextZones.push(z);
-  }
-  state.zones = nextZones;
-
-  // Delayed Blasts
-  const nextBlasts = [];
-  for (const b of state.delayedBlasts) {
-    b.delay -= dt;
-    if (b.delay <= 0) {
-      const owner = state.players.get(b.ownerId);
-      for (const tw of getAllTargets(state, b.ownerId)) {
-        const d = Math.hypot(tw.x - b.x, tw.y - b.y);
-        if (d <= b.radius + tw.r) {
-          const nx = d > 0.01 ? (tw.x - b.x) / d : 1;
-          const ny = d > 0.01 ? (tw.y - b.y) / d : 0;
-          applyDamage(state, owner, tw, b.damage, {
-            color: b.color,
-            slow: b.slow,
-            knockback: b.knockback,
-            kx: nx,
-            ky: ny,
-          });
-        }
-      }
-      pushEvent(state, { type: 'blast', x: b.x, y: b.y, r: b.radius, color: b.color });
     } else {
-      nextBlasts.push(b);
+      if (z.kind === 'trail') z.points = z.points.filter((pt) => pt.until > now);
+
+      // Continuous gravity pull
+      if (z.pull > 0) {
+        for (const tw of getAllTargets(state, z.ownerId)) {
+          if (tw.kind !== 'player') continue;
+          const dx = z.x - tw.x;
+          const dy = z.y - tw.y;
+          const d = Math.hypot(dx, dy);
+          if (d > 14 && d <= z.radius + tw.r) {
+            const dest = resolveCircleObstacles(
+              tw.ref.x + (dx / d) * z.pull * dt,
+              tw.ref.y + (dy / d) * z.pull * dt,
+              tw.r
+            );
+            tw.ref.x = dest.x;
+            tw.ref.y = dest.y;
+            tw.ref.forceSyncUntil = now + 200;
+          }
+        }
+      }
+
+      z.tickTimer -= dt;
+      if (z.tickTimer <= 0) {
+        z.tickTimer = z.tickRate;
+        if (z.kind === 'turret') {
+          const nearest = nearestTarget(state, z.ownerId, z.x, z.y, z.radius);
+          if (nearest) {
+            applyDamage(state, owner, nearest, z.damage, { color: z.color });
+            pushEvent(state, {
+              type: 'lightning',
+              segments: [{ x1: z.x, y1: z.y - 12, x2: nearest.x, y2: nearest.y }],
+              color: z.color,
+            });
+          }
+        } else {
+          for (const tw of getAllTargets(state, z.ownerId)) {
+            const inside =
+              z.kind === 'trail'
+                ? z.points.some((pt) => distSq(tw.x, tw.y, pt.x, pt.y) <= (z.radius + tw.r) ** 2)
+                : distSq(tw.x, tw.y, z.x, z.y) <= (z.radius + tw.r) ** 2;
+            if (inside) {
+              applyDamage(state, owner, tw, z.damage, { color: z.color, slow: z.slow, silence: z.silence });
+            }
+          }
+        }
+      }
     }
+
+    if (z.remaining > 0) next.push(z);
   }
-  state.delayedBlasts = nextBlasts;
+  state.zones = next;
+}
+
+function stepBlasts(state, dt) {
+  const next = [];
+  for (const b of state.delayedBlasts) {
+    // A time bomb rides on its victim until it goes off
+    if (b.kind === 'bomb' && b.attachId) {
+      const v = state.players.get(b.attachId);
+      if (v && v.alive) {
+        b.x = v.x;
+        b.y = v.y;
+      }
+    }
+    b.delay -= dt;
+    if (b.delay > 0) {
+      next.push(b);
+      continue;
+    }
+    const owner = state.players.get(b.ownerId);
+
+    if (b.kind === 'deadeye') {
+      // Targets that died, vanished into stealth, or ran far out of range dodge the shot
+      if (!owner || !owner.alive) continue;
+      const segments = [];
+      for (const id of b.targetIds) {
+        const t = state.players.get(id);
+        if (!t || !t.alive || t.stealthTimer > 0) continue;
+        if (Math.hypot(t.x - owner.x, t.y - owner.y) > b.range * 1.25) continue;
+        segments.push({ x1: owner.x, y1: owner.y, x2: t.x, y2: t.y });
+        applyDamage(state, owner, { kind: 'player', ref: t, x: t.x, y: t.y, r: t.radius }, b.damage, {
+          color: b.color,
+        });
+      }
+      pushEvent(state, { type: 'tracer', actorId: owner.id, x: owner.x, y: owner.y, segments, color: b.color });
+      continue;
+    }
+
+    for (const tw of getAllTargets(state, b.ownerId)) {
+      const d = Math.hypot(tw.x - b.x, tw.y - b.y);
+      if (d <= b.radius + tw.r) {
+        applyDamage(state, owner, tw, b.damage, {
+          color: b.color,
+          slow: b.slow,
+          knockback: b.knockback,
+          kx: d > 0.01 ? (tw.x - b.x) / d : 1,
+          ky: d > 0.01 ? (tw.y - b.y) / d : 0,
+        });
+      }
+    }
+    pushEvent(state, { type: 'blast', x: b.x, y: b.y, r: b.radius, color: b.color, big: b.kind === 'bomb' });
+  }
+  state.delayedBlasts = next;
 }
 
 function sanitizeName(name) {
@@ -1056,6 +1451,8 @@ export function joinPlayer({ session, name, charId, ip }) {
     existing.maxHp = charDef.hp;
     existing.hp = existing.alive ? Math.max(1, Math.round(charDef.hp * hpRatio)) : 0;
     existing.orbitTimer = 0;
+    existing.trailTimer = 0;
+    existing.history = []; // Rewind must not restore HP measured against another hero's max HP
     existing.lastSeen = now;
     const resolved = resolveCircleObstacles(existing.x, existing.y, existing.radius);
     existing.x = resolved.x;
@@ -1113,10 +1510,20 @@ export function joinPlayer({ session, name, charId, ip }) {
     shieldTimer: 0,
     slowTimer: 0,
     speedBuffTimer: 0,
+    silenceTimer: 0,
+    stealthTimer: 0,
+    ambushMult: 1,
+    trailTimer: 0,
+    trailZoneId: 0,
+    portalLockId: 0,
+    history: [],
+    historyTick: 0,
     orbitTimer: 0,
     orbitAngle: 0,
-    orbitRadius: 72,
-    orbitDamage: 9,
+    orbitRadius: 100,
+    orbitCount: 2,
+    orbitColor: '#ffffff',
+    orbitDamage: 0,
     orbitTick: 0,
     hitFlash: 0,
     attackAnim: 0,
@@ -1237,6 +1644,9 @@ export function buildSnapshot(state, selfId, sinceEventId = 0) {
 
   const players = [];
   for (const p of state.players.values()) {
+    // True stealth: enemies are not sent a stealthed player at all, so no client (or cheat) can draw them
+    const stealthed = p.alive && p.stealthTimer > 0;
+    if (stealthed && p.id !== selfId) continue;
     players.push({
       id: p.id,
       name: p.name,
@@ -1255,8 +1665,13 @@ export function buildSnapshot(state, selfId, sinceEventId = 0) {
       haste: p.speedBuffTimer > 0,
       hit: p.hitFlash > 0,
       atk: p.attackAnim > 0,
+      silenced: p.silenceTimer > 0,
+      stealth: stealthed,
+      trail: p.trailTimer > 0,
       orbit: p.orbitTimer > 0 ? Math.round(p.orbitAngle * 100) / 100 : null,
-      orbitR: p.orbitTimer > 0 ? p.orbitRadius || 144 : undefined,
+      orbitR: p.orbitTimer > 0 ? p.orbitRadius : undefined,
+      orbitN: p.orbitTimer > 0 ? p.orbitCount : undefined,
+      orbitC: p.orbitTimer > 0 ? p.orbitColor : undefined,
       fseq: p.forcedSeq || 1,
       force: now < (p.forceSyncUntil || 0),
       cds:
@@ -1313,7 +1728,8 @@ export function buildSnapshot(state, selfId, sinceEventId = 0) {
     playerCount: state.players.size,
     players,
     projectiles: state.projectiles.map((pr) => {
-      const owner = pr.kind === 'hook' ? state.players.get(pr.ownerId) : null;
+      // Line skills draw a rope back to their thrower
+      const owner = pr.onHit === 'hook' || pr.onHit === 'grapple' ? state.players.get(pr.ownerId) : null;
       return {
         id: pr.id,
         ownerId: pr.ownerId,
@@ -1323,27 +1739,41 @@ export function buildSnapshot(state, selfId, sinceEventId = 0) {
         vy: Math.round(pr.vy),
         r: pr.radius,
         c: pr.color,
-        k: pr.kind,
+        k: pr.visual,
         ox: owner ? Math.round(owner.x) : undefined,
         oy: owner ? Math.round(owner.y) : undefined,
       };
     }),
-    zones: state.zones.map((z) => ({
-      id: z.id,
-      kind: z.kind,
-      x: Math.round(z.x),
-      y: Math.round(z.y),
-      r: z.radius,
-      c: z.color,
-      rem: Math.round(z.remaining * 10) / 10,
-    })),
+    // Ripples are drawn from their 'ripple' event; the zone only times the hits
+    zones: state.zones
+      .filter((z) => z.kind !== 'ripple')
+      .map((z) => ({
+        id: z.id,
+        kind: z.kind,
+        v: z.visual,
+        ownerId: z.ownerId,
+        x: Math.round(z.x),
+        y: Math.round(z.y),
+        r: z.radius,
+        c: z.color,
+        rem: Math.round(z.remaining * 10) / 10,
+        dur: z.duration,
+        bx: z.kind === 'portal' ? Math.round(z.bx) : undefined,
+        by: z.kind === 'portal' ? Math.round(z.by) : undefined,
+        pts: z.kind === 'trail' ? z.points.flatMap((pt) => [Math.round(pt.x), Math.round(pt.y)]) : undefined,
+      })),
     blasts: state.delayedBlasts.map((b) => ({
       id: b.id,
+      kind: b.kind,
+      v: b.visual || undefined,
       x: Math.round(b.x),
       y: Math.round(b.y),
       r: b.radius,
       c: b.color,
       p: Math.round((1 - b.delay / b.totalDelay) * 100) / 100,
+      at: b.kind === 'bomb' ? b.attachId : undefined,
+      tg: b.kind === 'deadeye' ? b.targetIds : undefined,
+      ownerId: b.ownerId,
     })),
     shrines: state.shrines.map((s) => ({ id: s.id, x: s.x, y: s.y, active: s.active })),
     totems: state.totems.map((t) => ({

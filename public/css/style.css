@@ -69,6 +69,13 @@ body {
   cursor: crosshair;
 }
 
+/* 2D nameplates & combat text drawn above the 3D view */
+.overlay-canvas {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+}
+
 /* Gilded Plates (tibo.dog inspired) */
 .gilded-plate {
   background: var(--plate);
@@ -488,6 +495,126 @@ body {
 
 .skill-slot.cast-flash {
   animation: slot-cast-pop 0.22s ease-out;
+}
+
+/* Center-screen callouts: slam in, hold, rise out */
+.callout {
+  position: fixed;
+  left: 50%;
+  top: 26%;
+  transform: translateX(-50%);
+  pointer-events: none;
+  text-align: center;
+  z-index: 5;
+}
+
+.callout-card {
+  font-family: var(--font-display);
+  font-weight: 900;
+  letter-spacing: 0.08em;
+  color: var(--title-ink);
+  text-shadow:
+    0 0 18px rgba(255, 196, 80, 0.75),
+    0 3px 0 #5a3a00,
+    0 6px 18px rgba(0, 0, 0, 0.7);
+  white-space: nowrap;
+  opacity: 0;
+}
+
+.callout-card .callout-main {
+  display: block;
+  font-size: clamp(40px, 7vw, 84px);
+  line-height: 1;
+}
+
+.callout-card .callout-sub {
+  display: block;
+  margin-top: 6px;
+  font-family: var(--font-serif);
+  font-size: clamp(14px, 1.8vw, 22px);
+  font-weight: 400;
+  letter-spacing: 0.3em;
+  color: #fff;
+}
+
+.callout-card.is-ko .callout-main {
+  color: #ff8a65;
+  font-size: clamp(32px, 5vw, 60px);
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .callout-card {
+    animation: callout-slam 1.9s cubic-bezier(0.2, 0.9, 0.2, 1) forwards;
+  }
+
+  @keyframes callout-slam {
+    0% {
+      opacity: 0;
+      transform: scale(2.6);
+      filter: blur(6px);
+    }
+    12% {
+      opacity: 1;
+      transform: scale(0.94);
+      filter: blur(0);
+    }
+    18% {
+      transform: scale(1.04);
+    }
+    24%,
+    78% {
+      opacity: 1;
+      transform: scale(1);
+    }
+    100% {
+      opacity: 0;
+      transform: translateY(-40px) scale(0.96);
+    }
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .callout-card {
+    animation: callout-fade 1.9s linear forwards;
+  }
+
+  @keyframes callout-fade {
+    0%,
+    80% {
+      opacity: 1;
+    }
+    100% {
+      opacity: 0;
+    }
+  }
+}
+
+/* A skill coming off cooldown: a light sweep across the slot */
+.skill-slot.just-ready::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  pointer-events: none;
+  background: linear-gradient(105deg, transparent 30%, rgba(255, 245, 190, 0.85) 50%, transparent 70%);
+  background-size: 250% 100%;
+  animation: slot-ready-sweep 0.55s ease-out forwards;
+}
+
+@keyframes slot-ready-sweep {
+  from {
+    background-position: 120% 0;
+    opacity: 1;
+  }
+  to {
+    background-position: -120% 0;
+    opacity: 0;
+  }
+}
+
+.skill-slot.is-silenced {
+  filter: grayscale(0.8) brightness(0.7);
+  border-color: #e040fb;
 }
 
 @keyframes slot-cast-pop {

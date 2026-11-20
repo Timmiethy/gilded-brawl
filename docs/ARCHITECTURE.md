@@ -2,7 +2,7 @@
 
 ## 1. What the Game Is
 
-**Gilded Brawl** is a zero-login, real-time multiplayer 2.5D pixel-art open-world PvP arena playable directly in the browser. Inspired by `tibo.dog`'s gilded gothic pixel-survivors aesthetic (`Cinzel` / `Marcellus` display typography, cream-gold `#fff59d` and obsidian `#0a0c12` palettes, crisp 16×16 pixel sprites with 2.5D oval shadows), players pick a display name and choose from **10 playable champions**, each with a distinct **normal attack** and **3 special skills**.
+**Gilded Brawl** is a zero-login, real-time multiplayer 3D open-world PvP arena playable directly in the browser. It renders with WebGL (three.js): golden-hour sun with real-time shadows, image-based reflections, bloom, fog, procedurally painted biomes, and animated 3D heroes. The HUD keeps the gilded gothic look (`Cinzel` / `Marcellus` typography, cream-gold `#fff59d` on obsidian `#0a0c12`). Players pick a display name and one of **10 heroes — living curiosities** — each with a **normal attack** and **3 special skills**.
 
 Players roam a seamless `2400 × 2400` open-world map divided into 4 distinct biomes (**Moonlit Ruins**, **Ember Forge**, **Whispering Meadow**, **Frost Sanctum**) surrounding a central **Gilded Courtyard**, contesting healing shrines and battling rival browser clients across continuous **90-second rounds**.
 
@@ -20,10 +20,10 @@ Browser Client (60 FPS)                       Node.js / Vercel Server (RAM)
 │  │  (VFX, SFX, local projectiles)├─────────►│                                  │
 │  └─ Non-blocking action dispatch │          │ game/engine.js (Singleton RAM)   │
 │                                  │◄─────────┤  ├─ globalThis.__GILDED_BRAWL__  │
-│ ArenaRenderer (Canvas 2D)        │ Snapshot │  ├─ Fixed-substep physics/combat │
-│  ├─ Y-sorted 2.5D depth drawing  │ (JSON)   │  ├─ 90s round + 6s intermission  │
-│  ├─ Smooth remote interpolation  │          │  ├─ Cooldowns, HP, KOs, shrines  │
-│  └─ Minimap, VFX, float numbers  │          │  └─ Wins leaderboard & event log │
+│ ArenaRenderer (three.js WebGL)   │ Snapshot │  ├─ Fixed-substep physics/combat │
+│  ├─ Lit 3D world, heroes, bloom  │ (JSON)   │  ├─ 90s round + 6s intermission  │
+│  ├─ Particles, zones, telegraphs │          │  ├─ Cooldowns, HP, KOs, shrines  │
+│  └─ 2D overlay text + minimap    │          │  └─ Wins leaderboard & event log │
 └──────────────────────────────────┘          └──────────────────────────────────┘
 ```
 
@@ -46,18 +46,25 @@ Browser Client (60 FPS)                       Node.js / Vercel Server (RAM)
 3. **Intermission Phase (`6s`):** Displays the winner(s), round standings, and countdown to the next round.
 4. **Next Round (`startNextRound`):** Automatically resets HP, cooldowns, shrines, totems, and spawn positions while preserving the Champions wins leaderboard in RAM.
 
-### 10 Playable Champions & Ability Archetypes
-Every character has 1 normal attack (`CLICK`) and 3 skills (`Q`, `E`, `R`) built on a data-driven combat engine supporting 12 skill archetypes:
-- **Tibo** (*Bruiser*, 130 HP): Potato Toss, Pack Rush (`dash_strike`), Hound Whistle (`orbit_hounds`), Gilded Slam (`nova`).
-- **Poteto** (*Brawler*, 145 HP): Mallet Swing (`melee`), Rolling Cask (`explosive_proj`), Starch Nova (`nova`), Grand Hammerfall (`cone_slam`).
-- **Biscuit** (*Pyromancer*, 110 HP): Cinder Bolt (`projectile`), Flame Fan (`spread_proj`), Scorch Puddle (`zone`), Solar Bark (`nova` + speed buff).
-- **Sir Reginald** (*Vanguard*, 165 HP): Shield Bash (`melee`), Aegis Bulwark (`shield_pulse`), Chain Hook (`hook`), Bastion Quake (`nova`).
-- **Nyx** (*Assassin*, 105 HP): Twin Fangs (`melee`), Shadowstep (`blink_strike`), Eclipse Kunai (`spread_proj`, piercing), Phantom Flurry (`nova`).
-- **Mochi** (*Controller*, 115 HP): Icicle Shard (`projectile`, piercing), Glacier Wave (`spread_proj` + slow), Blizzard Ring (`zone` + slow), Absolute Bark (`nova` + slow).
-- **Baron Von Bark** (*Vampire*, 135 HP): Crimson Claw (`melee` + lifesteal), Bat Swarm (`spread_proj` + lifesteal), Blood Mist (`dash_strike` + haste), Sanguine Feast (`nova` + lifesteal).
-- **Sparky** (*Storm Mage*, 110 HP): Zap Bolt (`projectile`), Chain Lightning (`chain_lightning`), Tesla Pylon (`turret`), Thunderstrike (`delayed_blast`).
-- **Moss** (*Druid*, 125 HP): Thorn Arrow (`projectile`), Bramble Snare (`delayed_blast` + slow), Verdant Bloom (`heal_nova`), Razor Volley (`spread_proj`, piercing).
-- **Waffle** (*Artillery*, 115 HP): Starlight Orb (`explosive_proj`), Gravity Well (`zone` + pull), Comet Drop (`delayed_blast`), Supernova Beam (`beam`).
+### 10 Heroes & Skill Archetypes
+Every hero has 1 normal attack (`CLICK`) and 3 skills (`Q`, `E`, `R`). Moves are pure data in `public/shared/characters.js`: `type` picks an engine archetype, and optional fields tune it (see the comment at the top of that file).
+
+| Hero | Role | CLICK | Q | E | R |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **Tock**, the Clockwork Wren (115 HP) | Chronomancer | Ricochet Cog (bounces once) | **Rewind** — back to where you were 2s ago, with that HP | **Stasis Bubble** — enemy shots crawl at 20% | **Time Bomb** — sticks to a foe, blows up 1.6s later |
+| **Marrow**, the Lantern Ghost (105 HP) | Trickster | Wisp Flick (homing) | **Fade** — true stealth, +50% first strike | **Soul Swap** — trade places with the foe hit | **Banshee Wail** — expanding ring that silences |
+| **Prickle Jo**, the Cactus Gunslinger (120 HP) | Sharpshooter | Needle Shot | **Trick Shot** — 3 ricochets, re-hits after each | Tumbleweed Roll (dash) | **High Noon** — lock on to everyone in a cone, fire 0.8s later |
+| **Fold**, the Origami Ronin (110 HP) | Duelist | Paper Cut (melee) | **Crane Grapple** — zip to a wall or foe | **Shuriken Bloom** — boomerangs, hit out and back | **Thousand Folds** — blink through up to 4 foes |
+| **Nell**, the Jellyfish Astronomer (110 HP) | Cosmic Mage | Star Mote (splash) | **Wormhole** — linked portals for players *and* shots | Tidal Undertow (pull zone) | **Meteor Shower** — 6 staggered meteors |
+| **Brontë**, the Pocket Thundercloud (115 HP) | Storm Caller | Drizzle Bolt | Forked Lightning (chain) | **Static Dome** — destroys enemy shots | **Eye of the Storm** — 4 orbiting orbs + haste |
+| **Sir Steep**, the Teacup Knight (165 HP) | Vanguard | Saucer Bash (melee) | **Scalding Spill** — sprint leaving a damage trail | Sugar Shield (shield + pulse) | Kettle Geyser (delayed blast) |
+| **Morel**, the Mushroom Alchemist (125 HP) | Sporecaster | Spore Puff (3-spread) | **Sporelings** — slow homing bursts | Fairy Ring (heal + pulse) | **Mind Bloom** — silence zone |
+| **Vendetta**, the Vending Golem (170 HP) | Juggernaut | Soda Lob (splash) | **Coin Spray** — 6 ricocheting coins | Snack Turret | OUT OF ORDER (cone slam) |
+| **Beacon**, the Wandering Lighthouse (145 HP) | Warden | Foghorn (wide melee) | Rescue Line (hook) | Lighthouse Beam | **Riptide** — tidal ripple with huge knockback |
+
+Engine archetypes: `projectile` and `spread_proj` (with `bounces` ricochet, `homing`, `returns` boomerang, `pierce`, `splash`, and `onHit` = `hook` / `swap` / `grapple` / `curse`), `melee`, `cone_slam`, `dash_strike`, `blink_chain`, `shield_pulse`, `heal_nova`, `orbit`, `stealth`, `rewind`, `zone` (with `pull`, `slow`, `silence`, `projSlow` stasis, `barrier`), `turret`, `portal`, `trail`, `ripple`, `delayed_blast` (with `count`/`scatter`/`stagger` showers), `deadeye`, `chain_lightning`, and `beam`.
+
+Status effects: **slow** (also enforced by the server's movement budget), **haste**, **shield**, **silence** (no skills; the basic attack still works), and **stealth**. Stealth is real: the server leaves a stealthed player out of every other player's snapshot, so no client or cheat can draw them. Auto-aimed effects (homing, chains, turrets, lock-ons, blinks) cannot pick a stealthed player; area damage still hits them.
 
 ### Rate Limiting & Anti-Abuse Protections
 - **Per-IP fixed-window rate limits:** `/api/tick` (120/s), `/api/status` (60/s), `/api/join` (10/10s), `/api/leave` (12/10s), any other path (30/s, one shared bucket so path variations cannot mint new buckets). A `429` names the limit and sends `Retry-After`. Receipts for each number are in `api/game.js`.
@@ -75,16 +82,20 @@ Every character has 1 normal attack (`CLICK`) and 3 skills (`Q`, `E`, `R`) built
 ### Server & Shared Data
 - **[`server.js`](../server.js):** Zero-dependency Node.js HTTP server (and Vercel entrypoint). Serves static files from `public/`, routes `/api/*` to `api/game.js`, and runs a 30 Hz `stepEngine` loop locally.
 - **[`api/game.js`](../api/game.js):** Unified API router for `/api/join` (also switches hero), `/api/tick`, `/api/leave`, and `/api/status`. Implements per-IP rate limiting, trusted-IP resolution, 4 KB body size enforcement, JSON parsing, method checks, and `session` validation.
-- **[`game/engine.js`](../game/engine.js):** Authoritative in-RAM simulation singleton (`globalThis.__GILDED_BRAWL_STATE__`). Handles player lifecycle, timeout pruning (12s), movement validation, collision resolution, all 12 combat skill archetypes, shrines, practice totems, round countdown/intermission transitions, co-winner calculation, leaderboard persistence, and snapshot serialization.
+- **[`game/engine.js`](../game/engine.js):** Authoritative in-RAM simulation singleton (`globalThis.__GILDED_BRAWL_STATE__`). Handles player lifecycle, timeout pruning (12s), movement validation, collision resolution, every skill archetype (ricochet/homing/boomerang projectiles, portals, stasis, barriers, trails, ripples, lock-ons, rewind, stealth), shrines, practice totems, round countdown/intermission transitions, co-winner calculation, leaderboard persistence, and snapshot serialization.
 - **[`public/shared/characters.js`](../public/shared/characters.js):** Shared roster definitions for all 10 champions (base HP, speed, hitbox radius, palette, normal attack, and 3 skills with damage, cooldowns, ranges, and status effects). Imported by both server and client.
-- **[`public/shared/physics.js`](../public/shared/physics.js):** Shared circle-vs-obstacle collision and dash tracing, imported by both the server simulation and the client prediction.
-- **[`public/shared/map.js`](../public/shared/map.js):** Shared `2400 × 2400` open-world geometry — biome boundaries, 28 circular 2.5D obstacles, 12 spawn points, 5 healing shrines, 2 practice totems, and round/intermission durations (`90s` / `6s`).
+- **[`public/shared/physics.js`](../public/shared/physics.js):** Shared circle-vs-obstacle collision, ricochet contact normals, and dash tracing, imported by both the server simulation and the client prediction.
+- **[`public/shared/map.js`](../public/shared/map.js):** Shared `2400 × 2400` open-world geometry — biome boundaries, 28 circular obstacles, 12 spawn points, 5 healing shrines, 2 practice totems, and round/intermission durations (`90s` / `6s`).
 - **[`vercel.json`](../vercel.json):** Single source of response headers: `Cache-Control: no-store` on `/api/*` and security/CSP headers on all routes. `server.js` applies the same rules locally.
 
 ### Frontend Client
-- **[`public/index.html`](../public/index.html):** Semantic HTML document containing the full-viewport game `<canvas>`, HUD plates (round timer, biome, Champions leaderboard, kill feed, minimap, HP/shield bar, 4-slot skill bar), round summary overlay, and native `<dialog>` onboarding/hero-select modal.
-- **[`public/css/style.css`](../public/css/style.css):** Gilded gothic pixel-UI stylesheet (`Cinzel`/`Marcellus` + monospace `tabular-nums`), top-layer `<dialog>` entrance/exit transitions (`@starting-style`, `transition-behavior: allow-discrete`, staggered hero card reveals), `:user-invalid`/`:user-valid` name validation styling, and cooldown sweep animations.
-- **[`public/js/main.js`](../public/js/main.js):** Client controller — `sessionStorage` player identity, onboarding modal & accessible ARIA validation sync, physical `e.code` (`WASD` + `Q`/`E`/`R`) & pointer input handlers, 0ms local action/movement prediction, non-blocking `/api/tick` dispatch, remote player/projectile interpolation, and 60 FPS `requestAnimationFrame` loop.
-- **[`public/js/renderer.js`](../public/js/renderer.js):** 2.5D Canvas renderer — biome ground tiles & courtyard sigils, Y-sorted 2.5D obstacles/shrines/totems/players with elliptical ground shadows, directional aim chevron, leader crowns, melee cleave wedges, double-ring novas, chains, lightning arcs, laser beams, particles, floating damage numbers, screen shake, and minimap.
-- **[`public/js/sprites.js`](../public/js/sprites.js):** Procedural 16×16 pixel-art sprite generator producing crisp offscreen canvases (idle, 2-frame walk cycle, white hit-flash, and onboarding portrait data URLs) for all 10 champions.
+- **[`public/index.html`](../public/index.html):** Semantic HTML document containing the full-viewport game `<canvas>`, HUD plates (round timer, biome, Champions leaderboard, kill feed, minimap, HP/shield bar, 4-slot skill bar), center-screen callouts, round summary overlay, and native `<dialog>` onboarding/hero-select modal.
+- **[`public/css/style.css`](../public/css/style.css):** Gilded gothic UI stylesheet (`Cinzel`/`Marcellus` + monospace `tabular-nums`), top-layer `<dialog>` entrance/exit transitions, `:user-invalid`/`:user-valid` name validation, cooldown sweeps, the skill-ready light sweep, silenced slots, and the round / knockout callout animations (with `prefers-reduced-motion` fallbacks).
+- **[`public/js/main.js`](../public/js/main.js):** Client controller — secret session key & duplicate-tab detection, onboarding modal & accessible ARIA validation sync, physical `e.code` (`WASD` + `Q`/`E`/`R`) & pointer input handlers, 0ms local action/movement prediction, non-blocking `/api/tick` dispatch with `fseq` ack, remote player/projectile interpolation, and the 60 FPS `requestAnimationFrame` loop.
+- **[`public/js/render/renderer.js`](../public/js/render/renderer.js):** The 3D renderer (`ArenaRenderer`): WebGL setup, ACES tone mapping, image-based lighting (`RoomEnvironment`), texel-snapped sun shadows that follow the camera, bloom (`UnrealBloomPass`), camera follow with shake and zoom punch, ground-plane aim picking, hero lifecycle, footstep dust, and the aim reticle.
+- **[`public/js/render/world.js`](../public/js/render/world.js):** Seeded procedural world — terrain painted to a 2048² texture (biome blends, roads, flagstones, lava fissures with an emissive map, ice sheets in a roughness map, courtyard paving and compass), 3D props for every obstacle kind, walls and corner towers, braziers, shrines, practice dummies, instanced grass (GPU wind sway), rocks, flowers, bushes, snow, ice and obsidian, per-biome ambient particles, and fading of props that hide the player.
+- **[`public/js/render/heroes.js`](../public/js/render/heroes.js):** The 10 hero models, built from primitives with PBR materials, and their animation rigs (walk cycles, hover, wings, spinning gears, swinging lantern, tentacles, flickering lightning legs, sweeping lighthouse beam). Shared animation states: idle breathing, attack squash-and-stretch, hit flash and recoil, death topple and fade, spawn pop-in (ease-out-back). Status visuals: fresnel shield bubble, silence glyph, slow/haste rings, leader crown, orbiting orbs. Hero portraits are rendered from the same models.
+- **[`public/js/render/fx.js`](../public/js/render/fx.js):** Effects — GPU point particles (additive sparks and soft smoke), a 3D look per projectile style (cog, needle, shuriken, wisp, spore, coin, rope, bomb), live visuals for every zone (clock-face stasis bubble, hex-shield dome, whirlpool, mind-bloom mandala, portals, tea trail, snack turret), telegraphs (falling meteors, geyser, ticking bomb, High Noon crosshairs and laser sights), and an animated effect for every combat event.
+- **[`public/js/render/overlay.js`](../public/js/render/overlay.js)** and **[`minimap.js`](../public/js/render/minimap.js):** 2D nameplates, HP/shield bars, pop-up damage numbers above the 3D view; the world minimap.
+- **[`public/vendor/three/`](../public/vendor/three/):** three.js (pinned in `package.json`), copied from `node_modules` by `npm run vendor:three`. The script rewrites the addons' bare `'three'` imports to a path, because the strict CSP forbids an inline import map.
 - **[`public/js/audio.js`](../public/js/audio.js):** Lightweight procedural Web Audio API 16-bit synthesizer for attack, skill, hit, heal, KO, and round-horn sound effects with mute toggle.
