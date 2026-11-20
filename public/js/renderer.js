@@ -207,15 +207,16 @@ export class ArenaRenderer {
     }
   }
 
-  render(world, selfId, renderPlayers, nowSec, aimWorld) {
+  render(world, selfId, renderPlayers, renderProjectiles, nowSec, dt, aimWorld) {
     const ctx = this.ctx;
     const me = renderPlayers.get(selfId);
 
-    // Smooth camera follow
+    // Frame-rate independent smooth camera follow (silky on 60Hz & 120Hz ProMotion)
     const targetCamX = me ? me.x : WORLD_HALF;
     const targetCamY = me ? me.y : WORLD_HALF;
-    this.camX += (targetCamX - this.camX) * 0.14;
-    this.camY += (targetCamY - this.camY) * 0.14;
+    const camAlpha = 1 - Math.exp(-11 * Math.min(0.05, dt || 0.016));
+    this.camX += (targetCamX - this.camX) * camAlpha;
+    this.camY += (targetCamY - this.camY) * camAlpha;
 
     const shakeX = this.shake > 0 ? (Math.random() - 0.5) * this.shake : 0;
     const shakeY = this.shake > 0 ? (Math.random() - 0.5) * this.shake : 0;
@@ -225,8 +226,8 @@ export class ArenaRenderer {
 
     ctx.save();
     ctx.translate(
-      Math.round(this.width / 2 - this.camX + shakeX),
-      Math.round(this.height / 2 - this.camY + shakeY)
+      this.width / 2 - this.camX + shakeX,
+      this.height / 2 - this.camY + shakeY
     );
 
     this.drawGround(ctx, nowSec);
@@ -272,7 +273,7 @@ export class ArenaRenderer {
     for (const item of drawList) item.draw();
 
     // Projectiles & VFX on top
-    this.drawProjectiles(ctx, world);
+    this.drawProjectiles(ctx, renderProjectiles);
     this.drawSlashes(ctx);
     this.drawNovas(ctx);
     this.drawBeams(ctx);
@@ -710,9 +711,9 @@ export class ArenaRenderer {
     }
   }
 
-  drawProjectiles(ctx, world) {
-    if (!world?.projectiles) return;
-    for (const pr of world.projectiles) {
+  drawProjectiles(ctx, renderProjectiles) {
+    if (!renderProjectiles) return;
+    for (const pr of renderProjectiles.values()) {
       ctx.save();
       // Iron chain line for Sir Reginald's Chain Hook
       if (pr.k === 'hook' && pr.ox !== undefined && pr.oy !== undefined) {

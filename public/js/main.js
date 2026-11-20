@@ -1,6 +1,6 @@
 // Gilded Brawl — Client Controller, 60 FPS Loop, Smooth Interpolation & Server Sync
 import { CHARACTERS, CHARACTER_MAP } from '/shared/characters.js';
-import { getBiomeAt, BIOMES } from '/shared/map.js';
+import { getBiomeAt, BIOMES, WORLD_SIZE, OBSTACLES } from '/shared/map.js';
 import { getHeroSprites } from './sprites.js';
 import { ArenaRenderer } from './renderer.js';
 import { sfx } from './audio.js';
@@ -62,8 +62,11 @@ let isJoined = false;
 let latestWorld = null;
 let lastEventId = 0;
 let syncInFlight = false;
+let flushNeeded = false;
 let pendingActions = [];
+let lastLeaderboardHtml = '';
 const renderPlayers = new Map(); // id -> smoothly interpolated player state
+const renderProjectiles = new Map(); // id -> smoothly extrapolated projectile state
 
 // Input state
 const keys = new Set();
@@ -71,6 +74,26 @@ let mouseScreen = { x: window.innerWidth / 2, y: window.innerHeight / 2 };
 let lastArenaAimWorld = null;
 let mouseDown = false;
 let localCds = { basic: 0, s0: 0, s1: 0, s2: 0 };
+let lastForcedSeq = 0;
+
+function resolveLocalObstacles(x, y, radius) {
+  const margin = 44;
+  let nx = Math.max(margin + radius, Math.min(WORLD_SIZE - margin - radius, x));
+  let ny = Math.max(margin + radius, Math.min(WORLD_SIZE - margin - radius, y));
+  for (const ob of OBSTACLES) {
+    const dx = nx - ob.x;
+    const dy = ny - ob.y;
+    const minD = radius + ob.r;
+    const d2 = dx * dx + dy * dy;
+    if (d2 < minD * minD) {
+      const d = Math.sqrt(d2) || 0.001;
+      const push = minD - d;
+      nx += (dx / d) * push;
+      ny += (dy / d) * push;
+    }
+  }
+  return { x: nx, y: ny };
+}
 
 // --- Accessible Validation Sync (validate-input-after-interaction) ---
 const announcer = document.createElement('div');
@@ -111,19 +134,62 @@ nameInput.addEventListener('input', () => {
   syncNameAria(false);
 });
 
-// Prevent Escape closing onboarding dialog before the player has joined
+// Top-layer exit fallback for browsers lacking overlay or discrete display transitions
+let supportsDisplayTransition;
+function canTransitionDisplay() {
+  if (supportsDisplayTransition !== undefined) return supportsDisplayTransition;
+  if (!window.CSS?.supports?.('transition-behavior', 'allow-discrete') || !document.body) {
+    return false;
+  }
+  const probe = document.createElement('div');
+  probe.style.cssText = 'transition: display 1s allow-discrete !important; display: block;';
+  document.body.appendChild(probe);
+  getComputedStyle(probe).display;
+  probe.style.display = 'none';
+  supportsDisplayTransition = getComputedStyle(probe).display === 'block';
+  probe.remove();
+  return supportsDisplayTransition;
+}
+
+function supportsTopLayerExit() {
+  return Boolean(window.CSS?.supports?.('overlay', 'auto') && canTransitionDisplay());
+}
+
+async function closeOnboardingDialog() {
+  if (!dialogEl.open) return;
+  if (!supportsTopLayerExit()) {
+    dialogEl.setAttribute('data-closing', '');
+    const anims = dialogEl.getAnimations({ subtree: true });
+    if (anims.length > 0) {
+      await Promise.race([
+        Promise.allSettled(anims.map((a) => a.finished)),
+        new Promise((r) => setTimeout(r, 600)),
+      ]);
+    }
+    if (!dialogEl.hasAttribute('data-closing')) return;
+    dialogEl.removeAttribute('data-closing');
+  }
+  dialogEl.close();
+  if (document.activeElement && document.activeElement !== document.body) {
+    document.activeElement.blur();
+  }
+}
+
+// Prevent Escape closing onboarding dialog before the player has joined; animate exit when allowed
 dialogEl.addEventListener('cancel', (e) => {
-  if (!isJoined) e.preventDefault();
+  e.preventDefault();
+  if (isJoined) closeOnboardingDialog();
 });
 
 // --- Build Onboarding 10-Hero Roster ---
 function renderRoster() {
   charGridEl.innerHTML = '';
-  for (const ch of CHARACTERS) {
+  CHARACTERS.forEach((ch, idx) => {
     const sp = getHeroSprites(ch.id);
     const btn = document.createElement('button');
     btn.type = 'button';
     btn.className = 'char-card';
+    btn.style.setProperty('--i', String(idx));
     btn.setAttribute('role', 'radio');
     btn.setAttribute('aria-checked', ch.id === selectedCharId ? 'true' : 'false');
     btn.dataset.charId = ch.id;
@@ -141,7 +207,7 @@ function renderRoster() {
       sfx.play('shoot');
     });
     charGridEl.appendChild(btn);
-  }
+  });
   updateRosterSelection();
 }
 
@@ -180,11 +246,18 @@ function updateRosterSelection() {
 }
 
 // --- Join / Switch Hero API ---
-async function joinArena(name, charId) {
+async function joinArena(name, charId, preservePos = false) {
+  const me = preservePos ? renderPlayers.get(CLIENT_ID) : null;
   const res = await fetch('/api/join', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ clientId: CLIENT_ID, name, charId }),
+    body: JSON.stringify({
+      clientId: CLIENT_ID,
+      name,
+      charId,
+      x: me ? Math.round(me.x) : undefined,
+      y: me ? Math.round(me.y) : undefined,
+    }),
   });
   if (!res.ok) throw new Error('Join failed');
   const snap = await res.json();
@@ -194,14 +267,11 @@ async function joinArena(name, charId) {
   sessionStorage.setItem('gilded_brawl_name', name);
   sessionStorage.setItem('gilded_brawl_char', charId);
 
-  applySnapshot(snap, true);
+  applySnapshot(snap, !preservePos);
   updateHeroHudStatic();
   hudEl.hidden = false;
   btnCancelSwitch.hidden = false;
-  if (dialogEl.open) dialogEl.close();
-  if (document.activeElement && document.activeElement !== document.body) {
-    document.activeElement.blur();
-  }
+  if (dialogEl.open) await closeOnboardingDialog();
 }
 
 function updateHeroHudStatic() {
@@ -245,7 +315,7 @@ btnSwitchHero.addEventListener('click', () => {
 });
 
 btnCancelSwitch.addEventListener('click', () => {
-  if (dialogEl.open && isJoined) dialogEl.close();
+  if (dialogEl.open && isJoined) closeOnboardingDialog();
 });
 
 btnMute.addEventListener('click', () => {
@@ -290,6 +360,8 @@ function queueAction(actionKey, fromHudClick = false) {
   // Flush immediately instead of waiting for next 70ms poll!
   if (!syncInFlight) {
     syncWithServer();
+  } else {
+    flushNeeded = true;
   }
 }
 
@@ -409,6 +481,9 @@ async function syncWithServer() {
         clientId: CLIENT_ID,
         ix,
         iy,
+        cx: me ? Math.round(me.x * 10) / 10 : undefined,
+        cy: me ? Math.round(me.y * 10) / 10 : undefined,
+        moving: Math.hypot(ix, iy) > 0.1,
         aim,
         actions,
         lastEventId,
@@ -417,9 +492,9 @@ async function syncWithServer() {
 
     if (res.ok) {
       const snap = await res.json();
-      // Auto-rejoin transparently if serverless cold-started
+      // Auto-rejoin transparently preserving current position if serverless cold-started
       if (!snap.joined && isJoined && playerName) {
-        await joinArena(playerName, selectedCharId);
+        await joinArena(playerName, selectedCharId, true);
         return;
       }
       applySnapshot(snap, false);
@@ -428,6 +503,10 @@ async function syncWithServer() {
     // Transient network hiccup — next tick will recover
   } finally {
     syncInFlight = false;
+    if (flushNeeded) {
+      flushNeeded = false;
+      syncWithServer();
+    }
   }
 }
 
@@ -451,11 +530,14 @@ function applySnapshot(snap, snapImmediate) {
     const existing = renderPlayers.get(sp.id);
     if (!existing || snapImmediate) {
       renderPlayers.set(sp.id, { ...sp, tx: sp.x, ty: sp.y });
+      if (sp.id === CLIENT_ID) lastForcedSeq = sp.fseq || 1;
     } else {
       existing.tx = sp.x;
       existing.ty = sp.y;
-      if (sp.id !== CLIENT_ID) existing.aim = sp.aim;
-      existing.moving = sp.moving;
+      if (sp.id !== CLIENT_ID) {
+        existing.aim = sp.aim;
+        existing.moving = sp.moving;
+      }
       existing.hp = sp.hp;
       existing.maxHp = sp.maxHp;
       existing.shield = sp.shield;
@@ -469,11 +551,20 @@ function applySnapshot(snap, snapImmediate) {
       existing.charId = sp.charId;
       existing.name = sp.name;
       existing.cds = sp.cds;
-      if (sp.id === CLIENT_ID && sp.cds) {
-        localCds = { ...sp.cds };
-      }
-      // Snap cleanly on dashes/blinks/respawns so movement never rubber-bands
-      if (Math.hypot(existing.x - sp.x, existing.y - sp.y) > 110) {
+      existing.force = sp.force;
+
+      if (sp.id === CLIENT_ID) {
+        if (sp.cds) localCds = { ...sp.cds };
+        // Only snap/force-move self on server-authoritative displacements (dash, blink, hook, respawn, new round, knockback)
+        if ((sp.fseq || 1) !== lastForcedSeq) {
+          lastForcedSeq = sp.fseq || 1;
+          existing.x = sp.x;
+          existing.y = sp.y;
+        } else if (sp.force) {
+          existing.x += (sp.x - existing.x) * 0.45;
+          existing.y += (sp.y - existing.y) * 0.45;
+        }
+      } else if (Math.hypot(existing.x - sp.x, existing.y - sp.y) > 220) {
         existing.x = sp.x;
         existing.y = sp.y;
       }
@@ -481,6 +572,31 @@ function applySnapshot(snap, snapImmediate) {
   }
   for (const id of renderPlayers.keys()) {
     if (!seen.has(id)) renderPlayers.delete(id);
+  }
+
+  // Reconcile projectiles smoothly (never snap backwards!)
+  const seenProj = new Set();
+  if (Array.isArray(snap.projectiles)) {
+    for (const pr of snap.projectiles) {
+      seenProj.add(pr.id);
+      const existing = renderProjectiles.get(pr.id);
+      if (!existing) {
+        renderProjectiles.set(pr.id, { ...pr });
+      } else {
+        existing.vx = pr.vx;
+        existing.vy = pr.vy;
+        existing.ox = pr.ox;
+        existing.oy = pr.oy;
+        // Only nudge gently if drifted far; otherwise let smooth 60 FPS extrapolation run
+        if (Math.hypot(existing.x - pr.x, existing.y - pr.y) > 95) {
+          existing.x = pr.x;
+          existing.y = pr.y;
+        }
+      }
+    }
+  }
+  for (const id of renderProjectiles.keys()) {
+    if (!seenProj.has(id)) renderProjectiles.delete(id);
   }
 
   // Process combat events
@@ -541,8 +657,8 @@ function updateHud(snap) {
     }
   }
 
-  // Leaderboard
-  leaderboardList.innerHTML = (snap.leaderboard || [])
+  // Leaderboard (skip DOM rewrite if unchanged to avoid thrashing)
+  const lbHtml = (snap.leaderboard || [])
     .map((row, idx) => {
       const cls = [
         'lb-row',
@@ -562,6 +678,10 @@ function updateHud(snap) {
       `;
     })
     .join('');
+  if (lbHtml !== lastLeaderboardHtml) {
+    lastLeaderboardHtml = lbHtml;
+    leaderboardList.innerHTML = lbHtml;
+  }
 
   // Intermission Round Summary Overlay
   if (snap.phase === 'intermission' && snap.lastRoundSummary) {
@@ -632,12 +752,19 @@ function frame(now) {
         const ch = CHARACTER_MAP[p.charId] || CHARACTERS[0];
         if (mvLen > 0.01) {
           const sp = ch.speed * (p.slow ? 0.56 : 1) * (p.haste ? 1.38 : 1);
-          p.x += (ix / mvLen) * sp * dt;
-          p.y += (iy / mvLen) * sp * dt;
+          const next = resolveLocalObstacles(
+            p.x + (ix / mvLen) * sp * dt,
+            p.y + (iy / mvLen) * sp * dt,
+            ch.radius
+          );
+          p.x = next.x;
+          p.y = next.y;
           p.moving = true;
+        } else {
+          p.moving = false;
         }
-        p.x += (p.tx - p.x) * Math.min(1, dt * 15);
-        p.y += (p.ty - p.y) * Math.min(1, dt * 15);
+      } else {
+        p.moving = false;
       }
     } else {
       p.x += (p.tx - p.x) * Math.min(1, dt * 16);
@@ -658,16 +785,14 @@ function frame(now) {
     updateCdSlot('s2', localCds.s2, ch.skills[2].cooldown);
   }
 
-  // Extrapolate projectiles smoothly between server ticks
-  if (latestWorld?.projectiles) {
-    for (const pr of latestWorld.projectiles) {
-      pr.x += pr.vx * dt;
-      pr.y += pr.vy * dt;
-    }
+  // Extrapolate projectiles smoothly at 60 FPS
+  for (const pr of renderProjectiles.values()) {
+    pr.x += pr.vx * dt;
+    pr.y += pr.vy * dt;
   }
 
   renderer.updateFx(dt);
-  renderer.render(latestWorld, CLIENT_ID, renderPlayers, now / 1000, liveAimWorld);
+  renderer.render(latestWorld, CLIENT_ID, renderPlayers, renderProjectiles, now / 1000, dt, liveAimWorld);
 
   requestAnimationFrame(frame);
 }

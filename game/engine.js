@@ -13,6 +13,12 @@ import {
 const PLAYER_TIMEOUT_MS = 12_000;
 const RESPAWN_TIME_SEC = 4.0;
 const MAX_EVENTS = 160;
+const MAX_PLAYERS = 60;
+const MAX_PLAYERS_PER_IP = 4;
+const MAX_LEADERBOARD = 200;
+const MAX_PROJECTILES = 120;
+const MAX_ZONES = 40;
+const MAX_DELAYED_BLASTS = 30;
 const MARGIN = 44;
 
 function clamp(v, lo, hi) {
@@ -184,6 +190,7 @@ function applyDamage(state, attacker, targetWrap, rawDamage, opts = {}) {
   if (opts.knockback && opts.kx !== undefined && opts.ky !== undefined) {
     victim.kbx += opts.kx * opts.knockback;
     victim.kby += opts.ky * opts.knockback;
+    victim.forceSyncUntil = Date.now() + 350;
   }
   if (opts.slow) {
     victim.slowTimer = Math.max(victim.slowTimer, opts.slow);
@@ -264,6 +271,7 @@ function castAction(state, player, actionKey, aimX, aimY) {
     case 'projectile':
     case 'explosive_proj':
     case 'hook': {
+      if (state.projectiles.length >= MAX_PROJECTILES) break;
       state.projectiles.push({
         id: state.nextEntityId++,
         ownerId: player.id,
@@ -291,6 +299,7 @@ function castAction(state, player, actionKey, aimX, aimY) {
       const count = def.count || 3;
       const spread = def.spread || 0.4;
       for (let i = 0; i < count; i++) {
+        if (state.projectiles.length >= MAX_PROJECTILES) break;
         const frac = count === 1 ? 0 : i / (count - 1) - 0.5;
         const a = angle + frac * spread;
         const cx = Math.cos(a);
@@ -392,6 +401,7 @@ function castAction(state, player, actionKey, aimX, aimY) {
       const resolved = resolveCircleObstacles(cx, cy, player.radius);
       player.x = resolved.x;
       player.y = resolved.y;
+      player.forcedSeq = (player.forcedSeq || 0) + 1;
 
       if (def.type === 'blink_strike') {
         for (const tw of getAllTargets(state, player.id)) {
@@ -459,6 +469,7 @@ function castAction(state, player, actionKey, aimX, aimY) {
 
     case 'zone':
     case 'turret': {
+      if (state.zones.length >= MAX_ZONES) state.zones.shift();
       const clampedDist = Math.min(targetDist, def.range || 350);
       const zx = clamp(player.x + dirX * clampedDist, MARGIN + 30, WORLD_SIZE - MARGIN - 30);
       const zy = clamp(player.y + dirY * clampedDist, MARGIN + 30, WORLD_SIZE - MARGIN - 30);
@@ -482,6 +493,7 @@ function castAction(state, player, actionKey, aimX, aimY) {
     }
 
     case 'delayed_blast': {
+      if (state.delayedBlasts.length >= MAX_DELAYED_BLASTS) state.delayedBlasts.shift();
       const clampedDist = Math.min(targetDist, def.range || 400);
       const bx = clamp(player.x + dirX * clampedDist, MARGIN + 30, WORLD_SIZE - MARGIN - 30);
       const by = clamp(player.y + dirY * clampedDist, MARGIN + 30, WORLD_SIZE - MARGIN - 30);
@@ -658,6 +670,7 @@ function startNextRound(state, now) {
     const sp = pickSpawn(state);
     p.x = sp.x;
     p.y = sp.y;
+    p.forcedSeq = (p.forcedSeq || 0) + 1;
     p.hp = charDef.hp;
     p.maxHp = charDef.hp;
     p.alive = true;
@@ -737,6 +750,7 @@ function stepPhysics(state, dt, now) {
         const sp = pickSpawn(state);
         p.x = sp.x;
         p.y = sp.y;
+        p.forcedSeq = (p.forcedSeq || 0) + 1;
         p.hp = Math.round(p.maxHp * 0.65);
         p.alive = true;
         p.kbx = 0;
@@ -771,24 +785,17 @@ function stepPhysics(state, dt, now) {
     }
 
     if (state.phase === 'playing') {
-      let speedMult = 1;
-      if (p.slowTimer > 0) speedMult *= 0.56;
-      if (p.speedBuffTimer > 0) speedMult *= 1.38;
-
-      const mvLen = Math.hypot(p.inputX, p.inputY);
-      const nx = mvLen > 0.01 ? p.inputX / mvLen : 0;
-      const ny = mvLen > 0.01 ? p.inputY / mvLen : 0;
-
-      const vx = nx * p.speed * speedMult + p.kbx;
-      const vy = ny * p.speed * speedMult + p.kby;
-
-      p.kbx *= Math.pow(0.02, dt);
-      p.kby *= Math.pow(0.02, dt);
-
-      const nextPos = resolveCircleObstacles(p.x + vx * dt, p.y + vy * dt, p.radius);
-      p.x = nextPos.x;
-      p.y = nextPos.y;
-      p.moving = mvLen > 0.1;
+      const hasKnockback = Math.hypot(p.kbx, p.kby) > 4;
+      if (hasKnockback) {
+        const nextPos = resolveCircleObstacles(p.x + p.kbx * dt, p.y + p.kby * dt, p.radius);
+        p.x = nextPos.x;
+        p.y = nextPos.y;
+        p.kbx *= Math.pow(0.02, dt);
+        p.kby *= Math.pow(0.02, dt);
+      } else {
+        p.kbx = 0;
+        p.kby = 0;
+      }
 
       // Shrine pickups
       for (const sh of state.shrines) {
@@ -851,6 +858,7 @@ function stepPhysics(state, dt, now) {
             const dest = resolveCircleObstacles(tw.x + (dx / d) * pullD, tw.y + (dy / d) * pullD, tw.r);
             tw.ref.x = dest.x;
             tw.ref.y = dest.y;
+            tw.ref.forcedSeq = (tw.ref.forcedSeq || 0) + 1;
             applyDamage(state, owner, tw, pr.damage, { color: pr.color, slow: 1.0 });
             pushEvent(state, { type: 'dash', x1: tw.x, y1: tw.y, x2: dest.x, y2: dest.y, color: pr.color });
           } else {
@@ -915,6 +923,7 @@ function stepPhysics(state, dt, now) {
           );
           tw.ref.x = dest.x;
           tw.ref.y = dest.y;
+          tw.ref.forceSyncUntil = now + 200;
         }
       }
     }
@@ -981,7 +990,7 @@ function stepPhysics(state, dt, now) {
   state.delayedBlasts = nextBlasts;
 }
 
-export function joinPlayer({ clientId, name, charId }) {
+export function joinPlayer({ clientId, name, charId, x, y, ip }) {
   const now = Date.now();
   const state = stepEngine(now);
   const safeId = String(clientId || '').slice(0, 48) || `p_${Math.random().toString(36).slice(2, 10)}`;
@@ -989,14 +998,38 @@ export function joinPlayer({ clientId, name, charId }) {
     String(name || 'Wanderer')
       .trim()
       .replace(/[^\p{L}\p{N}\s_\-'.!]/gu, '')
+      .replace(/\s+/g, ' ')
       .slice(0, 18) || 'Wanderer';
   const charDef = CHARACTER_MAP[charId] || CHARACTERS[0];
 
   const existing = state.players.get(safeId);
-  const sp = existing ? { x: existing.x, y: existing.y } : pickSpawn(state);
+  if (!existing) {
+    if (state.players.size >= MAX_PLAYERS) {
+      return { error: 'Arena is currently full (60/60 players). Try again shortly.', status: 429 };
+    }
+    if (ip && ip !== 'unknown') {
+      let sameIpCount = 0;
+      for (const p of state.players.values()) {
+        if (p.ip === ip) sameIpCount += 1;
+      }
+      if (sameIpCount >= MAX_PLAYERS_PER_IP) {
+        return { error: 'Too many active players from this network (max 4).', status: 429 };
+      }
+    }
+  }
+
+  let sp;
+  if (existing) {
+    sp = { x: existing.x, y: existing.y };
+  } else if (Number.isFinite(Number(x)) && Number.isFinite(Number(y))) {
+    sp = resolveCircleObstacles(Number(x), Number(y), charDef.radius);
+  } else {
+    sp = pickSpawn(state);
+  }
 
   const player = {
     id: safeId,
+    ip: ip || existing?.ip || 'unknown',
     name: safeName,
     charId: charDef.id,
     x: sp.x,
@@ -1028,6 +1061,9 @@ export function joinPlayer({ clientId, name, charId }) {
     cooldowns: { basic: 0, s0: 0, s1: 0, s2: 0 },
     roundDamage: existing ? existing.roundDamage : 0,
     roundKos: existing ? existing.roundKos : 0,
+    forcedSeq: existing ? existing.forcedSeq || 1 : 1,
+    forceSyncUntil: 0,
+    lastMoveAt: now,
     joinedAt: existing ? existing.joinedAt : now,
     lastSeen: now,
   };
@@ -1035,6 +1071,18 @@ export function joinPlayer({ clientId, name, charId }) {
   state.players.set(safeId, player);
 
   if (!state.leaderboard.has(safeId)) {
+    if (state.leaderboard.size >= MAX_LEADERBOARD) {
+      // Prune lowest-win offline entry to keep RAM strictly bounded
+      let victimKey = null;
+      let minWins = Infinity;
+      for (const [k, entry] of state.leaderboard.entries()) {
+        if (!state.players.has(k) && entry.wins < minWins) {
+          minWins = entry.wins;
+          victimKey = k;
+        }
+      }
+      if (victimKey) state.leaderboard.delete(victimKey);
+    }
     state.leaderboard.set(safeId, {
       id: safeId,
       name: safeName,
@@ -1060,22 +1108,46 @@ export function leavePlayer(clientId) {
 
 export function handleTick(payload) {
   const now = Date.now();
-  const { clientId, ix, iy, aim, actions, lastEventId } = payload || {};
-  const preState = getState();
-  const prePlayer = preState.players.get(clientId);
-  if (prePlayer) {
-    prePlayer.lastSeen = now;
-    prePlayer.inputX = clamp(Number(ix) || 0, -1, 1);
-    prePlayer.inputY = clamp(Number(iy) || 0, -1, 1);
-    if (Number.isFinite(Number(aim))) prePlayer.aim = Number(aim);
-  }
-
+  const { clientId, ix, iy, cx, cy, moving, aim, actions, lastEventId } = payload || {};
   const state = stepEngine(now);
   const player = state.players.get(clientId);
-  if (player && Array.isArray(actions)) {
-    for (const act of actions.slice(0, 4)) {
-      if (act && act.key) {
-        castAction(state, player, act.key, Number(act.tx) || player.x, Number(act.ty) || player.y);
+
+  if (player) {
+    const dtMove = Math.min(0.6, Math.max(0.016, (now - (player.lastMoveAt || now)) / 1000));
+    player.lastSeen = now;
+    player.lastMoveAt = now;
+    player.inputX = clamp(Number(ix) || 0, -1, 1);
+    player.inputY = clamp(Number(iy) || 0, -1, 1);
+    player.moving = Boolean(moving) || Math.hypot(player.inputX, player.inputY) > 0.1;
+    if (Number.isFinite(Number(aim))) player.aim = Number(aim);
+
+    // Accept smooth client-predicted position when alive & playing, clamped to valid max speed + obstacles
+    if (
+      state.phase === 'playing' &&
+      player.alive &&
+      now >= (player.forceSyncUntil || 0) &&
+      Number.isFinite(Number(cx)) &&
+      Number.isFinite(Number(cy))
+    ) {
+      let speedMult = 1;
+      if (player.slowTimer > 0) speedMult *= 0.56;
+      if (player.speedBuffTimer > 0) speedMult *= 1.38;
+      const maxStep = player.speed * speedMult * dtMove + 48;
+      const dx = Number(cx) - player.x;
+      const dy = Number(cy) - player.y;
+      const dist = Math.hypot(dx, dy);
+      const targetX = dist > maxStep ? player.x + (dx / dist) * maxStep : Number(cx);
+      const targetY = dist > maxStep ? player.y + (dy / dist) * maxStep : Number(cy);
+      const resolved = resolveCircleObstacles(targetX, targetY, player.radius);
+      player.x = resolved.x;
+      player.y = resolved.y;
+    }
+
+    if (Array.isArray(actions)) {
+      for (const act of actions.slice(0, 4)) {
+        if (act && act.key) {
+          castAction(state, player, act.key, Number(act.tx) || player.x, Number(act.ty) || player.y);
+        }
       }
     }
   }
@@ -1117,6 +1189,8 @@ export function buildSnapshot(state, selfId, sinceEventId = 0) {
       hit: p.hitFlash > 0,
       atk: p.attackAnim > 0,
       orbit: p.orbitTimer > 0 ? Math.round(p.orbitAngle * 100) / 100 : null,
+      fseq: p.forcedSeq || 1,
+      force: now < (p.forceSyncUntil || 0),
       cds:
         p.id === selfId
           ? {
