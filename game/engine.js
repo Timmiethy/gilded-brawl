@@ -4,22 +4,41 @@ import {
   WORLD_SIZE,
   ROUND_DURATION_SEC,
   INTERMISSION_SEC,
-  OBSTACLES,
   SPAWN_POINTS,
   SHRINE_SPOTS,
   PRACTICE_TOTEM_SPOTS,
 } from '../public/shared/map.js';
+import { MARGIN, resolveCircleObstacles, hitsObstacle, dashDistance, traceDash } from '../public/shared/physics.js';
 
 const PLAYER_TIMEOUT_MS = 12_000;
 const RESPAWN_TIME_SEC = 4.0;
-const MAX_EVENTS = 160;
 const MAX_PLAYERS = 60;
 const MAX_PLAYERS_PER_IP = 4;
 const MAX_LEADERBOARD = 200;
-const MAX_PROJECTILES = 120;
-const MAX_ZONES = 40;
-const MAX_DELAYED_BLASTS = 30;
-const MARGIN = 44;
+
+// Tripwires, sized from the roster (receipts below) so healthy play never touches them.
+// Projectiles: worst kit alive at once is Moss (2 thorn arrows + 7 Razor Volley thorns) ≈ 10 per player.
+//   60 players × 10 = 600 → cap 1024.
+// Zones / delayed blasts: every zone lasts less than its cooldown and every blast delay is ≤ 0.5s against
+//   a ≥ 6s cooldown, so ≤ 1 each per player → 60 → cap 128.
+// Events: a 60-player brawl emits a few hundred events per second; 1024 keeps ~2s of history for slow clients.
+const MAX_PROJECTILES = 1024;
+const MAX_ZONES = 128;
+const MAX_DELAYED_BLASTS = 128;
+const MAX_EVENTS = 1024;
+
+// Movement budget: a client may bank up to this much unspent travel time (covers a 600ms network stall)
+// plus a fixed slack for server-side displacements (player separation, obstacle push-out).
+const MOVE_BANK_SEC = 0.6;
+const MOVE_SLACK_PX = 48;
+
+const lastBudgetWarnAt = new Map();
+function warnBudget(name, limit) {
+  const now = Date.now();
+  if (now - (lastBudgetWarnAt.get(name) || 0) < 10_000) return;
+  lastBudgetWarnAt.set(name, now);
+  console.warn(`[engine] budget ${name}=${limit} reached; the newest entity was dropped. Remeasure the receipt in game/engine.js.`);
+}
 
 function clamp(v, lo, hi) {
   return v < lo ? lo : v > hi ? hi : v;
@@ -47,8 +66,12 @@ function createInitialState() {
     lastStepAt: now,
     nextEntityId: 1,
     nextEventId: 1,
-    players: new Map(), // clientId -> player object
-    leaderboard: new Map(), // clientId -> { id, name, charId, wins, kos, damage }
+    nextPlayerNum: 1,
+    // The session key is the client's secret credential; it never leaves the server.
+    // Everything else (snapshots, events, leaderboard) uses the public player id.
+    sessions: new Map(), // session key -> public player id
+    players: new Map(), // public player id -> player object
+    leaderboard: new Map(), // public player id -> { id, session, name, charId, wins, kos, damage }
     projectiles: [],
     zones: [], // DoT zones, gravity wells, turrets
     delayedBlasts: [], // thunderstrike, comet drop, bramble snare
@@ -98,33 +121,6 @@ function pickSpawn(state) {
   };
 }
 
-function resolveCircleObstacles(x, y, radius) {
-  let nx = clamp(x, MARGIN + radius, WORLD_SIZE - MARGIN - radius);
-  let ny = clamp(y, MARGIN + radius, WORLD_SIZE - MARGIN - radius);
-  for (const ob of OBSTACLES) {
-    const dx = nx - ob.x;
-    const dy = ny - ob.y;
-    const minD = radius + ob.r;
-    const d2 = dx * dx + dy * dy;
-    if (d2 < minD * minD) {
-      const d = Math.sqrt(d2) || 0.001;
-      const push = minD - d;
-      nx += (dx / d) * push;
-      ny += (dy / d) * push;
-    }
-  }
-  return { x: nx, y: ny };
-}
-
-function hitsObstacle(x, y, radius) {
-  if (x < MARGIN || x > WORLD_SIZE - MARGIN || y < MARGIN || y > WORLD_SIZE - MARGIN) return true;
-  for (const ob of OBSTACLES) {
-    const minD = radius + ob.r;
-    if (distSq(x, y, ob.x, ob.y) < minD * minD) return true;
-  }
-  return false;
-}
-
 function getAllTargets(state, attackerId) {
   const targets = [];
   for (const p of state.players.values()) {
@@ -160,9 +156,7 @@ function applyDamage(state, attacker, targetWrap, rawDamage, opts = {}) {
       t.respawnAt = Date.now() + 5000;
       pushEvent(state, { type: 'blast', x: t.x, y: t.y, r: 48, color: '#ffe082' });
     }
-    if (attacker && opts.lifesteal) {
-      healPlayer(state, attacker, opts.lifesteal);
-    }
+    // Practice totems are for testing combos: they grant no lifesteal, so they cannot be farmed for healing.
     return;
   }
 
@@ -271,7 +265,10 @@ function castAction(state, player, actionKey, aimX, aimY) {
     case 'projectile':
     case 'explosive_proj':
     case 'hook': {
-      if (state.projectiles.length >= MAX_PROJECTILES) break;
+      if (state.projectiles.length >= MAX_PROJECTILES) {
+        warnBudget('MAX_PROJECTILES', MAX_PROJECTILES);
+        break;
+      }
       state.projectiles.push({
         id: state.nextEntityId++,
         ownerId: player.id,
@@ -299,7 +296,10 @@ function castAction(state, player, actionKey, aimX, aimY) {
       const count = def.count || 3;
       const spread = def.spread || 0.4;
       for (let i = 0; i < count; i++) {
-        if (state.projectiles.length >= MAX_PROJECTILES) break;
+        if (state.projectiles.length >= MAX_PROJECTILES) {
+          warnBudget('MAX_PROJECTILES', MAX_PROJECTILES);
+          break;
+        }
         const frac = count === 1 ? 0 : i / (count - 1) - 0.5;
         const a = angle + frac * spread;
         const cx = Math.cos(a);
@@ -365,28 +365,18 @@ function castAction(state, player, actionKey, aimX, aimY) {
 
     case 'dash_strike':
     case 'blink_strike': {
-      const steps = def.type === 'blink_strike' ? 6 : 10;
-      const dist = Math.min(def.distance || 220, Math.max(90, targetDist));
+      const dist = dashDistance(def, targetDist);
       const startX = player.x;
       const startY = player.y;
-      let cx = player.x;
-      let cy = player.y;
-      const hitIds = new Set();
+      const { path, end } = traceDash(def.type, startX, startY, dirX, dirY, dist, player.radius);
 
-      for (let i = 1; i <= steps; i++) {
-        const tx = startX + dirX * (dist * (i / steps));
-        const ty = startY + dirY * (dist * (i / steps));
-        if (hitsObstacle(tx, ty, player.radius - 2)) {
-          if (def.type === 'dash_strike') break;
-          else continue;
-        }
-        cx = tx;
-        cy = ty;
-        if (def.type === 'dash_strike') {
+      if (def.type === 'dash_strike') {
+        const hitIds = new Set();
+        for (const pt of path) {
           for (const tw of getAllTargets(state, player.id)) {
             const tid = tw.ref.id;
             if (hitIds.has(tid)) continue;
-            if (Math.hypot(tw.x - cx, tw.y - cy) <= (def.radius || 44) + tw.r) {
+            if (Math.hypot(tw.x - pt.x, tw.y - pt.y) <= (def.radius || 44) + tw.r) {
               hitIds.add(tid);
               applyDamage(state, player, tw, def.damage, {
                 color: def.color,
@@ -399,9 +389,8 @@ function castAction(state, player, actionKey, aimX, aimY) {
         }
       }
 
-      const resolved = resolveCircleObstacles(cx, cy, player.radius);
-      player.x = resolved.x;
-      player.y = resolved.y;
+      player.x = end.x;
+      player.y = end.y;
       player.forcedSeq = (player.forcedSeq || 0) + 1;
 
       if (def.type === 'blink_strike') {
@@ -471,7 +460,10 @@ function castAction(state, player, actionKey, aimX, aimY) {
 
     case 'zone':
     case 'turret': {
-      if (state.zones.length >= MAX_ZONES) state.zones.shift();
+      if (state.zones.length >= MAX_ZONES) {
+        warnBudget('MAX_ZONES', MAX_ZONES);
+        break;
+      }
       const clampedDist = Math.min(targetDist, def.range || 350);
       const zx = clamp(player.x + dirX * clampedDist, MARGIN + 30, WORLD_SIZE - MARGIN - 30);
       const zy = clamp(player.y + dirY * clampedDist, MARGIN + 30, WORLD_SIZE - MARGIN - 30);
@@ -495,7 +487,10 @@ function castAction(state, player, actionKey, aimX, aimY) {
     }
 
     case 'delayed_blast': {
-      if (state.delayedBlasts.length >= MAX_DELAYED_BLASTS) state.delayedBlasts.shift();
+      if (state.delayedBlasts.length >= MAX_DELAYED_BLASTS) {
+        warnBudget('MAX_DELAYED_BLASTS', MAX_DELAYED_BLASTS);
+        break;
+      }
       const clampedDist = Math.min(targetDist, def.range || 400);
       const bx = clamp(player.x + dirX * clampedDist, MARGIN + 30, WORLD_SIZE - MARGIN - 30);
       const by = clamp(player.y + dirY * clampedDist, MARGIN + 30, WORLD_SIZE - MARGIN - 30);
@@ -650,6 +645,8 @@ function finishRound(state, now) {
 
   state.phase = 'intermission';
   state.phaseEndAt = now + INTERMISSION_SEC * 1000;
+  // All combat stops at the bell: hounds must not keep biting through the intermission.
+  for (const p of state.players.values()) p.orbitTimer = 0;
   state.projectiles = [];
   state.zones = [];
   state.delayedBlasts = [];
@@ -844,6 +841,12 @@ function stepPhysics(state, dt, now) {
         a.y -= uy * overlap;
         b.x += ux * overlap;
         b.y += uy * overlap;
+        const ra = resolveCircleObstacles(a.x, a.y, a.radius);
+        const rb = resolveCircleObstacles(b.x, b.y, b.radius);
+        a.x = ra.x;
+        a.y = ra.y;
+        b.x = rb.x;
+        b.y = rb.y;
       }
     }
   }
@@ -1005,48 +1008,95 @@ function stepPhysics(state, dt, now) {
   state.delayedBlasts = nextBlasts;
 }
 
-export function joinPlayer({ clientId, name, charId, x, y, ip }) {
-  const now = Date.now();
-  const state = stepEngine(now);
-  const safeId = String(clientId || '').slice(0, 48) || `p_${Math.random().toString(36).slice(2, 10)}`;
-  const safeName =
+function sanitizeName(name) {
+  return (
     String(name || 'Wanderer')
       .trim()
       .replace(/[^\p{L}\p{N}\s_\-'.!]/gu, '')
       .replace(/\s+/g, ' ')
-      .slice(0, 18) || 'Wanderer';
+      .slice(0, 18) || 'Wanderer'
+  );
+}
+
+function applyCharacter(player, charDef) {
+  player.charId = charDef.id;
+  player.speed = charDef.speed;
+  player.radius = charDef.radius;
+  player.color = charDef.color;
+}
+
+function pruneLeaderboardForNewEntry(state) {
+  if (state.leaderboard.size < MAX_LEADERBOARD) return;
+  // Drop the lowest-win offline entry (and its session) to keep RAM strictly bounded
+  let victim = null;
+  for (const entry of state.leaderboard.values()) {
+    if (!state.players.has(entry.id) && (!victim || entry.wins < victim.wins)) victim = entry;
+  }
+  if (victim) {
+    state.leaderboard.delete(victim.id);
+    state.sessions.delete(victim.session);
+  }
+}
+
+// Joins a new player, or switches hero for an existing one. Switching keeps HP ratio, life state,
+// cooldowns and position, so re-submitting the hero dialog can never heal, revive, or reset skills.
+export function joinPlayer({ session, name, charId, ip }) {
+  const now = Date.now();
+  const state = stepEngine(now);
+  const safeName = sanitizeName(name);
   const charDef = CHARACTER_MAP[charId] || CHARACTERS[0];
 
-  const existing = state.players.get(safeId);
-  if (!existing) {
-    if (state.players.size >= MAX_PLAYERS) {
-      return { error: 'Arena is currently full (60/60 players). Try again shortly.', status: 429 };
-    }
-    if (ip && ip !== 'unknown') {
-      let sameIpCount = 0;
-      for (const p of state.players.values()) {
-        if (p.ip === ip) sameIpCount += 1;
-      }
-      if (sameIpCount >= MAX_PLAYERS_PER_IP) {
-        return { error: 'Too many active players from this network (max 4).', status: 429 };
-      }
-    }
-  }
+  const knownId = state.sessions.get(session);
+  const existing = knownId ? state.players.get(knownId) : null;
 
-  let sp;
   if (existing) {
-    sp = { x: existing.x, y: existing.y };
-  } else if (Number.isFinite(Number(x)) && Number.isFinite(Number(y))) {
-    sp = resolveCircleObstacles(Number(x), Number(y), charDef.radius);
-  } else {
-    sp = pickSpawn(state);
+    const hpRatio = existing.maxHp > 0 ? existing.hp / existing.maxHp : 1;
+    applyCharacter(existing, charDef);
+    existing.name = safeName;
+    existing.maxHp = charDef.hp;
+    existing.hp = existing.alive ? Math.max(1, Math.round(charDef.hp * hpRatio)) : 0;
+    existing.orbitTimer = 0;
+    existing.lastSeen = now;
+    const resolved = resolveCircleObstacles(existing.x, existing.y, existing.radius);
+    existing.x = resolved.x;
+    existing.y = resolved.y;
+    const lb = state.leaderboard.get(existing.id);
+    if (lb) {
+      lb.name = safeName;
+      lb.charId = charDef.id;
+    }
+    return buildSnapshot(state, existing.id, 0);
   }
 
+  if (state.players.size >= MAX_PLAYERS) {
+    return { error: `Arena is full (max_players=${MAX_PLAYERS}). Try again shortly.`, status: 429 };
+  }
+  if (ip && ip !== 'unknown') {
+    let sameIpCount = 0;
+    for (const p of state.players.values()) {
+      if (p.ip === ip) sameIpCount += 1;
+    }
+    if (sameIpCount >= MAX_PLAYERS_PER_IP) {
+      return {
+        error: `Too many active players from this network (max_players_per_ip=${MAX_PLAYERS_PER_IP}).`,
+        status: 429,
+      };
+    }
+  }
+
+  // A returning session keeps its public id, so its leaderboard wins follow it across reloads.
+  let id = knownId;
+  if (!id) {
+    pruneLeaderboardForNewEntry(state);
+    id = `pl${state.nextPlayerNum++}`;
+    state.sessions.set(session, id);
+  }
+
+  const sp = pickSpawn(state);
   const player = {
-    id: safeId,
-    ip: ip || existing?.ip || 'unknown',
+    id,
+    ip: ip || 'unknown',
     name: safeName,
-    charId: charDef.id,
     x: sp.x,
     y: sp.y,
     aim: 0,
@@ -1057,9 +1107,6 @@ export function joinPlayer({ clientId, name, charId, x, y, ip }) {
     moving: false,
     hp: charDef.hp,
     maxHp: charDef.hp,
-    speed: charDef.speed,
-    radius: charDef.radius,
-    color: charDef.color,
     alive: true,
     respawnTimer: 0,
     shield: 0,
@@ -1074,85 +1121,84 @@ export function joinPlayer({ clientId, name, charId, x, y, ip }) {
     hitFlash: 0,
     attackAnim: 0,
     cooldowns: { basic: 0, s0: 0, s1: 0, s2: 0 },
-    roundDamage: existing ? existing.roundDamage : 0,
-    roundKos: existing ? existing.roundKos : 0,
-    forcedSeq: existing ? existing.forcedSeq || 1 : 1,
+    roundDamage: 0,
+    roundKos: 0,
+    forcedSeq: 1,
     forceSyncUntil: 0,
+    moveBudget: 0,
     lastMoveAt: now,
-    joinedAt: existing ? existing.joinedAt : now,
+    joinedAt: now,
     lastSeen: now,
   };
+  applyCharacter(player, charDef);
+  state.players.set(id, player);
 
-  state.players.set(safeId, player);
-
-  if (!state.leaderboard.has(safeId)) {
-    if (state.leaderboard.size >= MAX_LEADERBOARD) {
-      // Prune lowest-win offline entry to keep RAM strictly bounded
-      let victimKey = null;
-      let minWins = Infinity;
-      for (const [k, entry] of state.leaderboard.entries()) {
-        if (!state.players.has(k) && entry.wins < minWins) {
-          minWins = entry.wins;
-          victimKey = k;
-        }
-      }
-      if (victimKey) state.leaderboard.delete(victimKey);
-    }
-    state.leaderboard.set(safeId, {
-      id: safeId,
-      name: safeName,
-      charId: charDef.id,
-      wins: 0,
-      kos: 0,
-      damage: 0,
-    });
-  } else {
-    const lb = state.leaderboard.get(safeId);
+  const lb = state.leaderboard.get(id);
+  if (lb) {
     lb.name = safeName;
     lb.charId = charDef.id;
+  } else {
+    state.leaderboard.set(id, { id, session, name: safeName, charId: charDef.id, wins: 0, kos: 0, damage: 0 });
   }
 
-  return buildSnapshot(state, safeId, 0);
+  return buildSnapshot(state, id, 0);
 }
 
-export function leavePlayer(clientId) {
+export function leavePlayer(session) {
   const state = stepEngine(Date.now());
-  if (clientId) state.players.delete(clientId);
+  const id = state.sessions.get(session);
+  if (id) state.players.delete(id);
   return { ok: true };
+}
+
+function finiteOr(v, fallback) {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : fallback;
 }
 
 export function handleTick(payload) {
   const now = Date.now();
-  const { clientId, ix, iy, cx, cy, moving, aim, actions, lastEventId } = payload || {};
+  const { session, ix, iy, cx, cy, fseq, moving, aim, actions, lastEventId } = payload || {};
   const state = stepEngine(now);
-  const player = state.players.get(clientId);
+  const id = state.sessions.get(session);
+  const player = id ? state.players.get(id) : null;
 
   if (player) {
-    const dtMove = Math.min(0.6, Math.max(0.016, (now - (player.lastMoveAt || now)) / 1000));
-    player.lastSeen = now;
+    let speedMult = 1;
+    if (player.slowTimer > 0) speedMult *= 0.56;
+    if (player.speedBuffTimer > 0) speedMult *= 1.38;
+    const speed = player.speed * speedMult;
+    // Token-bucket movement budget: travel allowance grows with real elapsed time, never with tick count,
+    // so sending ticks faster cannot move a player faster.
+    const elapsedSec = Math.max(0, (now - player.lastMoveAt) / 1000);
+    player.moveBudget = Math.min(player.moveBudget + speed * elapsedSec, speed * MOVE_BANK_SEC + MOVE_SLACK_PX);
     player.lastMoveAt = now;
-    player.inputX = clamp(Number(ix) || 0, -1, 1);
-    player.inputY = clamp(Number(iy) || 0, -1, 1);
+    player.lastSeen = now;
+    player.inputX = clamp(finiteOr(ix, 0), -1, 1);
+    player.inputY = clamp(finiteOr(iy, 0), -1, 1);
     player.moving = Boolean(moving) || Math.hypot(player.inputX, player.inputY) > 0.1;
-    if (Number.isFinite(Number(aim))) player.aim = Number(aim);
+    const aimN = Number(aim);
+    if (Number.isFinite(aimN)) player.aim = Math.atan2(Math.sin(aimN), Math.cos(aimN));
 
-    // Accept smooth client-predicted position when alive & playing, clamped to valid max speed + obstacles
+    // Accept the client-predicted position only if the client has seen the latest server-forced move
+    // (fseq ack) — otherwise in-flight ticks would drag a hooked/dashed/respawned player back.
+    const ncx = Number(cx);
+    const ncy = Number(cy);
     if (
       state.phase === 'playing' &&
       player.alive &&
-      now >= (player.forceSyncUntil || 0) &&
-      Number.isFinite(Number(cx)) &&
-      Number.isFinite(Number(cy))
+      now >= player.forceSyncUntil &&
+      Number(fseq) === player.forcedSeq &&
+      Number.isFinite(ncx) &&
+      Number.isFinite(ncy)
     ) {
-      let speedMult = 1;
-      if (player.slowTimer > 0) speedMult *= 0.56;
-      if (player.speedBuffTimer > 0) speedMult *= 1.38;
-      const maxStep = player.speed * speedMult * dtMove + 48;
-      const dx = Number(cx) - player.x;
-      const dy = Number(cy) - player.y;
+      const dx = ncx - player.x;
+      const dy = ncy - player.y;
       const dist = Math.hypot(dx, dy);
-      const targetX = dist > maxStep ? player.x + (dx / dist) * maxStep : Number(cx);
-      const targetY = dist > maxStep ? player.y + (dy / dist) * maxStep : Number(cy);
+      const step = Math.min(dist, player.moveBudget);
+      const targetX = dist > step ? player.x + (dx / dist) * step : ncx;
+      const targetY = dist > step ? player.y + (dy / dist) * step : ncy;
+      player.moveBudget -= step;
       const resolved = resolveCircleObstacles(targetX, targetY, player.radius);
       player.x = resolved.x;
       player.y = resolved.y;
@@ -1160,14 +1206,14 @@ export function handleTick(payload) {
 
     if (Array.isArray(actions)) {
       for (const act of actions.slice(0, 4)) {
-        if (act && act.key) {
-          castAction(state, player, act.key, Number(act.tx) || player.x, Number(act.ty) || player.y);
+        if (act && typeof act.key === 'string') {
+          castAction(state, player, act.key, finiteOr(act.tx, player.x), finiteOr(act.ty, player.y));
         }
       }
     }
   }
 
-  return buildSnapshot(state, clientId, Number(lastEventId) || 0);
+  return buildSnapshot(state, player ? player.id : '', finiteOr(lastEventId, 0));
 }
 
 export function buildSnapshot(state, selfId, sinceEventId = 0) {
@@ -1249,10 +1295,15 @@ export function buildSnapshot(state, selfId, sinceEventId = 0) {
     })
     .slice(0, 12);
 
-  const events = sinceEventId > 0 ? state.events.filter((e) => e.id > sinceEventId) : state.events.slice(-12);
+  // A fresh cursor (0) or one from a previous server process (ahead of ours) gets no backlog, only our cursor,
+  // so a page load never replays old KOs and a server restart never silences a client.
+  const latestEventId = state.nextEventId - 1;
+  const cursorValid = sinceEventId > 0 && sinceEventId <= latestEventId;
+  const events = cursorValid ? state.events.filter((e) => e.id > sinceEventId) : [];
 
   return {
     now,
+    selfId: state.players.has(selfId) ? selfId : null,
     joined: state.players.has(selfId),
     roundNumber: state.roundNumber,
     phase: state.phase,
@@ -1307,6 +1358,6 @@ export function buildSnapshot(state, selfId, sinceEventId = 0) {
     leaderboard,
     lastRoundSummary: state.lastRoundSummary,
     events,
-    lastEventId: state.events.length ? state.events[state.events.length - 1].id : sinceEventId,
+    lastEventId: latestEventId,
   };
 }

@@ -2,13 +2,21 @@
 import { joinPlayer, leavePlayer, handleTick, stepEngine, buildSnapshot } from '../game/engine.js';
 
 const MAX_BODY_BYTES = 4096; // 4 KB strict limit to prevent memory abuse
+
+// Receipts: one tab polls every 70ms (14.3/s) and fires one extra tick per cast (≤ ~4/s with a held
+// basic attack + skills) ≈ 18/s; the engine allows 4 players per IP → 72/s. Cap at 120 as a tripwire.
+// Status is polled at 14.3/s by every tab that sits on the hero dialog; 60/s covers 4 such tabs.
 const RATE_LIMITS = {
-  tick: { max: 55, windowMs: 1000 }, // Supports multiple tabs on same IP + instant action sends
+  tick: { max: 120, windowMs: 1000 },
   join: { max: 10, windowMs: 10_000 },
-  switch: { max: 10, windowMs: 10_000 },
-  status: { max: 30, windowMs: 1000 },
+  status: { max: 60, windowMs: 1000 },
   leave: { max: 12, windowMs: 10_000 },
+  other: { max: 30, windowMs: 1000 },
 };
+
+// Proxy headers are client-controlled unless a trusted proxy overwrites them. Vercel's edge does;
+// a bare `node server.js` has no proxy, so there we trust only the socket address.
+const TRUST_PROXY = Boolean(process.env.VERCEL) || process.env.TRUST_PROXY === '1';
 
 function getRateLimiter() {
   if (!globalThis.__GILDED_BRAWL_RL__) {
@@ -17,20 +25,37 @@ function getRateLimiter() {
   return globalThis.__GILDED_BRAWL_RL__;
 }
 
+// One IPv6 subscriber usually owns a whole /64, so per-IP limits must count the /64, not the address.
+function ipv6Prefix64(addr) {
+  const [head, tail = ''] = addr.split('::');
+  const h = head ? head.split(':') : [];
+  const t = tail ? tail.split(':') : [];
+  const groups = addr.includes('::') ? [...h, ...Array(Math.max(0, 8 - h.length - t.length)).fill('0'), ...t] : h;
+  return `${groups
+    .slice(0, 4)
+    .map((g) => (g || '0').toLowerCase())
+    .join(':')}::/64`;
+}
+
+function normalizeIp(raw) {
+  let ip = String(raw || '').trim().slice(0, 64);
+  if (!ip) return 'unknown';
+  if (ip.startsWith('::ffff:') && ip.includes('.')) ip = ip.slice(7); // IPv4-mapped IPv6
+  return ip.includes(':') ? ipv6Prefix64(ip) : ip;
+}
+
 function getClientIp(req) {
-  const xff = req.headers['x-forwarded-for'];
-  if (typeof xff === 'string' && xff.length > 0) {
-    return xff.split(',')[0].trim().slice(0, 64);
+  if (TRUST_PROXY) {
+    const realIp = req.headers['x-real-ip'];
+    if (typeof realIp === 'string' && realIp.length > 0) return normalizeIp(realIp);
+    const xff = req.headers['x-forwarded-for'];
+    if (typeof xff === 'string' && xff.length > 0) return normalizeIp(xff.split(',')[0]);
   }
-  const realIp = req.headers['x-real-ip'];
-  if (typeof realIp === 'string' && realIp.length > 0) {
-    return realIp.trim().slice(0, 64);
-  }
-  return (req.socket?.remoteAddress || 'unknown').slice(0, 64);
+  return normalizeIp(req.socket?.remoteAddress);
 }
 
 function checkRateLimit(ip, action) {
-  const rule = RATE_LIMITS[action] || RATE_LIMITS.status;
+  const rule = RATE_LIMITS[action];
   const rl = getRateLimiter();
   const now = Date.now();
 
@@ -51,47 +76,62 @@ function checkRateLimit(ip, action) {
   bucket.count += 1;
   return {
     allowed: bucket.count <= rule.max,
+    limit: rule.max,
+    windowMs: rule.windowMs,
     retryAfterSec: Math.max(1, Math.ceil((bucket.resetAt - now) / 1000)),
   };
 }
 
-async function readBody(req) {
-  if (req.body && typeof req.body === 'object') return { ok: true, data: req.body };
-  if (typeof req.body === 'string') {
-    if (req.body.length > MAX_BODY_BYTES) return { ok: false, status: 413, error: 'Payload too large' };
-    try {
-      const parsed = JSON.parse(req.body);
-      return parsed && typeof parsed === 'object' ? { ok: true, data: parsed } : { ok: false, status: 400, error: 'Invalid JSON object' };
-    } catch {
-      return { ok: false, status: 400, error: 'Invalid JSON' };
+function parseJsonObject(raw) {
+  if (!raw) return { ok: true, data: {} };
+  try {
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      return { ok: false, status: 400, error: 'Expected JSON object' };
     }
+    return { ok: true, data: parsed };
+  } catch {
+    return { ok: false, status: 400, error: 'Invalid JSON' };
+  }
+}
+
+const TOO_LARGE = { ok: false, status: 413, error: `Payload too large (max_body_bytes=${MAX_BODY_BYTES})` };
+
+async function readBody(req) {
+  // Reject by declared size before any platform body parsing result is trusted
+  if (Number(req.headers['content-length'] || 0) > MAX_BODY_BYTES) return TOO_LARGE;
+
+  if (req.body !== undefined && req.body !== null) {
+    if (typeof req.body === 'string') {
+      if (Buffer.byteLength(req.body) > MAX_BODY_BYTES) return TOO_LARGE;
+      return parseJsonObject(req.body);
+    }
+    if (typeof req.body === 'object' && !Array.isArray(req.body) && !Buffer.isBuffer(req.body)) {
+      return { ok: true, data: req.body };
+    }
+    return { ok: false, status: 400, error: 'Expected JSON object' };
   }
 
   return new Promise((resolve) => {
-    let raw = '';
-    let tooLarge = false;
+    const chunks = [];
+    let bytes = 0;
+    let done = false;
+    const finish = (result) => {
+      if (done) return;
+      done = true;
+      resolve(result);
+    };
     req.on('data', (chunk) => {
-      if (tooLarge) return;
-      raw += chunk;
-      if (raw.length > MAX_BODY_BYTES) {
-        tooLarge = true;
-        resolve({ ok: false, status: 413, error: 'Payload too large' });
+      if (done) return;
+      bytes += chunk.length;
+      if (bytes > MAX_BODY_BYTES) {
+        finish(TOO_LARGE);
+        return;
       }
+      chunks.push(chunk);
     });
-    req.on('end', () => {
-      if (tooLarge) return;
-      if (!raw) return resolve({ ok: true, data: {} });
-      try {
-        const parsed = JSON.parse(raw);
-        if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
-          return resolve({ ok: false, status: 400, error: 'Expected JSON object' });
-        }
-        resolve({ ok: true, data: parsed });
-      } catch {
-        resolve({ ok: false, status: 400, error: 'Invalid JSON' });
-      }
-    });
-    req.on('error', () => resolve({ ok: false, status: 400, error: 'Read error' }));
+    req.on('end', () => finish(parseJsonObject(Buffer.concat(chunks).toString('utf8'))));
+    req.on('error', () => finish({ ok: false, status: 400, error: 'Read error' }));
   });
 }
 
@@ -104,9 +144,17 @@ function sendJson(res, status, data, extraHeaders = {}) {
   res.end(JSON.stringify(data));
 }
 
-function isValidClientId(id) {
-  return typeof id === 'string' && /^[a-zA-Z0-9_-]{3,48}$/.test(id);
+// The session key is a secret bearer credential (a crypto.randomUUID() from the client)
+function isValidSession(s) {
+  return typeof s === 'string' && /^[a-zA-Z0-9_-]{20,64}$/.test(s);
 }
+
+const ROUTES = {
+  join: 'POST',
+  tick: 'POST',
+  leave: 'POST',
+  status: 'GET',
+};
 
 export default async function handler(req, res) {
   const url = new URL(req.url || '/api/status', 'http://localhost');
@@ -119,50 +167,47 @@ export default async function handler(req, res) {
     return;
   }
 
-  const rl = checkRateLimit(ip, path);
+  // Unknown paths share one bucket, so varying the path cannot mint fresh rate-limit buckets
+  const action = Object.hasOwn(ROUTES, path) ? path : 'other';
+  const rl = checkRateLimit(ip, action);
   if (!rl.allowed) {
-    return sendJson(res, 429, { error: 'Too many requests' }, { 'Retry-After': String(rl.retryAfterSec) });
+    return sendJson(
+      res,
+      429,
+      { error: `Too many requests (${action}: max ${rl.limit} per ${rl.windowMs}ms per IP)` },
+      { 'Retry-After': String(rl.retryAfterSec) }
+    );
+  }
+
+  if (action === 'other') return sendJson(res, 404, { error: 'Not found' });
+  if (req.method !== ROUTES[action]) {
+    return sendJson(res, 405, { error: 'Method not allowed' }, { Allow: ROUTES[action] });
   }
 
   try {
-    if (req.method === 'POST' && (path === 'join' || path === 'switch')) {
-      const parsed = await readBody(req);
-      if (!parsed.ok) return sendJson(res, parsed.status, { error: parsed.error });
-      if (parsed.data.clientId && !isValidClientId(parsed.data.clientId)) {
-        return sendJson(res, 400, { error: 'Invalid clientId' });
-      }
-      const result = joinPlayer({ ...parsed.data, ip });
+    if (action === 'status') {
+      const state = stepEngine(Date.now());
+      const since = Number(url.searchParams.get('since') || 0);
+      return sendJson(res, 200, buildSnapshot(state, '', Number.isFinite(since) ? since : 0));
+    }
+
+    const parsed = await readBody(req);
+    if (!parsed.ok) {
+      // Close the socket so a client cannot keep streaming an oversized body into this connection
+      return sendJson(res, parsed.status, { error: parsed.error }, { Connection: 'close' });
+    }
+    if (!isValidSession(parsed.data.session)) {
+      return sendJson(res, 400, { error: 'Invalid session' });
+    }
+
+    if (action === 'join') {
+      const { session, name, charId } = parsed.data;
+      const result = joinPlayer({ session, name, charId, ip });
       if (result.error) return sendJson(res, result.status || 429, { error: result.error });
       return sendJson(res, 200, result);
     }
-
-    if (req.method === 'POST' && path === 'tick') {
-      const parsed = await readBody(req);
-      if (!parsed.ok) return sendJson(res, parsed.status, { error: parsed.error });
-      if (!isValidClientId(parsed.data.clientId)) {
-        return sendJson(res, 400, { error: 'Invalid clientId' });
-      }
-      const snap = handleTick(parsed.data);
-      return sendJson(res, 200, snap);
-    }
-
-    if (req.method === 'POST' && path === 'leave') {
-      const parsed = await readBody(req);
-      if (!parsed.ok) return sendJson(res, parsed.status, { error: parsed.error });
-      if (parsed.data.clientId && !isValidClientId(parsed.data.clientId)) {
-        return sendJson(res, 400, { error: 'Invalid clientId' });
-      }
-      return sendJson(res, 200, leavePlayer(parsed.data.clientId));
-    }
-
-    if (req.method === 'GET' && (path === 'status' || path === 'state')) {
-      const state = stepEngine(Date.now());
-      const selfId = url.searchParams.get('clientId') || '';
-      const since = Number(url.searchParams.get('since') || 0);
-      return sendJson(res, 200, buildSnapshot(state, isValidClientId(selfId) ? selfId : '', Number.isFinite(since) ? since : 0));
-    }
-
-    return sendJson(res, 404, { error: 'Not found' });
+    if (action === 'tick') return sendJson(res, 200, handleTick(parsed.data));
+    return sendJson(res, 200, leavePlayer(parsed.data.session));
   } catch (err) {
     console.error('API error:', err);
     return sendJson(res, 500, { error: 'Internal server error' });
