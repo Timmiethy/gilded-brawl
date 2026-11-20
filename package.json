@@ -1,0 +1,13 @@
+{
+  "name": "gilded-brawl",
+  "version": "1.0.0",
+  "description": "Gilded Brawl — a 2.5D pixel open-world PvP multiplayer arena game inspired by tibo.dog",
+  "type": "module",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}

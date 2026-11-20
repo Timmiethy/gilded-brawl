@@ -1,0 +1,220 @@
+<!doctype html>
+<html lang="en" data-theme="gilded">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <title>GILDED BRAWL — 2.5D Pixel Open-World PvP Arena</title>
+    <meta
+      name="description"
+      content="A free 2.5D gilded pixel open-world PvP browser arena inspired by tibo.dog. Pick from 10 heroes, battle in 90-second rounds, and claim the crown."
+    />
+    <meta name="theme-color" content="#0a0c12" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Cinzel:wght@700;900&family=Marcellus&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="/css/style.css" />
+  </head>
+  <body>
+    <main id="game-root">
+      <canvas id="arena-canvas" aria-label="Gilded Brawl Open-World PvP Arena"></canvas>
+
+      <!-- Live In-Game HUD -->
+      <div id="hud" class="hud" hidden>
+        <!-- Top-Left: Round & Biome Plaque -->
+        <section class="hud-top-left">
+          <div class="gilded-plate round-plate">
+            <div class="round-meta">
+              <span id="hud-round" class="kicker">ROUND 1</span>
+              <span id="hud-biome" class="biome-tag">Gilded Courtyard</span>
+            </div>
+            <div id="hud-timer" class="round-timer" aria-live="off">1:30</div>
+            <div class="round-sub">
+              <span id="hud-players">1 online</span>
+              <span class="dot">•</span>
+              <span>Most HP wins</span>
+            </div>
+          </div>
+
+          <div class="hud-controls-row">
+            <button id="btn-switch-hero" type="button" class="mini-btn" title="Switch Hero">
+              ⚔ Hero
+            </button>
+            <button id="btn-mute" type="button" class="mini-btn" title="Toggle Sound" aria-pressed="false">
+              🔊 Sound
+            </button>
+          </div>
+        </section>
+
+        <!-- Top-Right: Live Wins Leaderboard -->
+        <aside class="hud-top-right">
+          <div class="gilded-plate leaderboard-plate">
+            <div class="plate-header">
+              <span class="plate-title">CHAMPIONS</span>
+              <span class="plate-sub">WINS</span>
+            </div>
+            <ol id="leaderboard-list" class="leaderboard-list"></ol>
+          </div>
+          <div id="kill-feed" class="kill-feed" aria-live="polite"></div>
+        </aside>
+
+        <!-- Bottom-Left: Minimap -->
+        <aside class="hud-bottom-left">
+          <div class="gilded-plate minimap-plate">
+            <canvas id="minimap-canvas" width="150" height="150" aria-label="Arena Minimap"></canvas>
+            <div class="minimap-legend">
+              <span class="leg-self">● You</span>
+              <span class="leg-shrine">■ Shrine</span>
+              <span class="leg-foe">● Foe</span>
+            </div>
+          </div>
+        </aside>
+
+        <!-- Bottom-Center: Player Health & 4-Slot Skill Bar -->
+        <section class="hud-bottom-center">
+          <div id="respawn-banner" class="respawn-banner" hidden>
+            KNOCKED OUT — RESPAWNING IN <span id="respawn-sec">4.0</span>s
+          </div>
+
+          <div class="gilded-plate combat-bar">
+            <div class="self-status-row">
+              <div class="self-identity">
+                <img id="hud-portrait" class="hud-portrait" alt="" width="32" height="32" />
+                <div>
+                  <div id="hud-hero-name" class="hero-name">Tibo</div>
+                  <div id="hud-player-name" class="player-sub">Wanderer</div>
+                </div>
+              </div>
+              <div class="hp-wrap">
+                <div class="hp-label-row">
+                  <span>HEALTH</span>
+                  <span id="hud-hp-text" class="tabular">130 / 130</span>
+                </div>
+                <div class="hp-track">
+                  <div id="hud-hp-fill" class="hp-fill" style="width: 100%"></div>
+                  <div id="hud-shield-fill" class="shield-fill" style="width: 0%"></div>
+                </div>
+              </div>
+            </div>
+
+            <div class="skill-slots" id="skill-slots">
+              <button type="button" class="skill-slot" data-action="basic">
+                <span class="slot-key">CLICK</span>
+                <span class="slot-name" id="slot-basic-name">Basic</span>
+                <span class="slot-cd" id="slot-basic-cd"></span>
+              </button>
+              <button type="button" class="skill-slot" data-action="skill0">
+                <span class="slot-key">J</span>
+                <span class="slot-name" id="slot-s0-name">Skill 1</span>
+                <span class="slot-cd" id="slot-s0-cd"></span>
+              </button>
+              <button type="button" class="skill-slot" data-action="skill1">
+                <span class="slot-key">K</span>
+                <span class="slot-name" id="slot-s1-name">Skill 2</span>
+                <span class="slot-cd" id="slot-s1-cd"></span>
+              </button>
+              <button type="button" class="skill-slot" data-action="skill2">
+                <span class="slot-key">L</span>
+                <span class="slot-name" id="slot-s2-name">Skill 3</span>
+                <span class="slot-cd" id="slot-s2-cd"></span>
+              </button>
+            </div>
+            <div class="controls-hint">
+              W A S D: Move · Mouse: Aim · Click: Normal Attack · J / K / L: Special Skills
+            </div>
+          </div>
+        </section>
+      </div>
+
+      <!-- Round End / Intermission Banner -->
+      <section id="round-overlay" class="round-overlay" hidden aria-live="polite">
+        <div class="gilded-plate round-summary-card">
+          <div id="summary-kicker" class="kicker">ROUND 1 COMPLETE</div>
+          <h2 id="summary-winner" class="gilded-heading">👑 Winner</h2>
+          <p id="summary-sub" class="summary-sub">Most health remaining at the bell</p>
+          <ol id="summary-standings" class="summary-standings"></ol>
+          <div class="next-round-bar">
+            Next round begins in <strong id="summary-countdown" class="tabular">6</strong>s
+          </div>
+        </div>
+      </section>
+
+      <!-- Native Onboarding & Hero Selection Modal (<dialog>) -->
+      <dialog id="onboarding-dialog" aria-labelledby="onboarding-title" closedby="none">
+        <form id="onboarding-form" class="onboarding-shell" novalidate>
+          <header class="onboarding-header">
+            <div class="title-crest">2.5D GILDED PIXEL PVP ARENA</div>
+            <h1 id="onboarding-title" class="game-logo">GILDED BRAWL</h1>
+            <p class="onboarding-tagline">
+              No login. Pick your name &amp; champion, roam the open world, survive 1:30 — highest HP takes the crown.
+            </p>
+          </header>
+
+          <div class="name-field-wrap">
+            <label for="player-name-input" class="field-label">Challenger Name</label>
+            <span id="name-hint" class="field-hint">1–18 characters. Visible to all players in the arena.</span>
+            <input
+              id="player-name-input"
+              name="playerName"
+              type="text"
+              required
+              minlength="1"
+              maxlength="18"
+              autocomplete="nickname"
+              placeholder="e.g. SirBarksalot"
+              aria-describedby="name-hint"
+              data-error="name-error"
+              autofocus
+            />
+            <div id="name-error" class="error-msg">
+              <span role="img" aria-label="Error">❌</span> Please enter a challenger name (1–18 characters).
+            </div>
+          </div>
+
+          <div class="roster-layout">
+            <div class="roster-column">
+              <div class="section-kicker">CHOOSE YOUR CHAMPION (10 HEROES)</div>
+              <div id="character-grid" class="character-grid" role="radiogroup" aria-label="Select Champion"></div>
+            </div>
+
+            <aside class="preview-column gilded-inset" id="hero-preview">
+              <div class="preview-top">
+                <img id="preview-portrait" class="preview-portrait" alt="" width="64" height="64" />
+                <div>
+                  <div id="preview-role" class="role-badge">Bruiser</div>
+                  <h2 id="preview-name" class="preview-name">Tibo</h2>
+                  <div id="preview-title" class="preview-title">The Gilded Houndmaster</div>
+                </div>
+              </div>
+              <p id="preview-blurb" class="preview-blurb"></p>
+              <div class="preview-stats">
+                <div class="stat-pill">
+                  <span>MAX HP</span>
+                  <strong id="preview-hp" class="tabular">130</strong>
+                </div>
+                <div class="stat-pill">
+                  <span>SPEED</span>
+                  <strong id="preview-speed" class="tabular">240</strong>
+                </div>
+              </div>
+              <div id="preview-kit" class="preview-kit"></div>
+            </aside>
+          </div>
+
+          <footer class="onboarding-footer">
+            <button id="btn-cancel-switch" type="button" class="ui-btn secondary-btn" hidden>
+              Resume Battle
+            </button>
+            <button id="btn-enter-arena" type="submit" class="ui-btn primary-btn">
+              ⚔ ENTER ARENA
+            </button>
+          </footer>
+        </form>
+      </dialog>
+    </main>
+
+    <script type="module" src="/js/main.js"></script>
+  </body>
+</html>
