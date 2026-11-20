@@ -129,6 +129,13 @@
       </div>
 
       <!-- Round End / Intermission Banner -->
+      <!-- Shown when the game server has not answered for a while (never fail silently) -->
+      <div id="connection-banner" class="connection-banner" role="alert" hidden>
+        <strong>Lost connection to the game server.</strong>
+        <span id="connection-detail"></span>
+        <button id="btn-reload" type="button" class="ui-btn primary-btn">Reload</button>
+      </div>
+
       <!-- Animated center-screen callouts (round start, your knockouts) -->
       <div id="callout" class="callout" aria-live="polite"></div>
 

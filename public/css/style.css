@@ -497,6 +497,34 @@ body {
   animation: slot-cast-pop 0.22s ease-out;
 }
 
+/* Lost-connection banner (while the modal dialog is open, main.js shows the message inside it) */
+.connection-banner {
+  position: fixed;
+  top: 14px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 50;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  max-width: min(92vw, 720px);
+  padding: 10px 14px;
+  border: 2px solid #ff8a80;
+  border-radius: 8px;
+  background: rgba(60, 12, 12, 0.94);
+  color: #fff;
+  font-size: 13px;
+}
+
+.connection-banner[hidden] {
+  display: none;
+}
+
+.connection-banner .ui-btn {
+  padding: 6px 14px;
+  font-size: 13px;
+}
+
 /* Center-screen callouts: slam in, hold, rise out */
 .callout {
   position: fixed;

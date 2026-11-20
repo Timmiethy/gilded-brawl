@@ -52,7 +52,9 @@ function getClientIp(req) {
     const xff = req.headers['x-forwarded-for'];
     const hops = typeof xff === 'string' ? xff.split(',').map((s) => s.trim()).filter(Boolean) : [];
     if (hops.length >= TRUST_PROXY_HOPS) return normalizeIp(hops[hops.length - TRUST_PROXY_HOPS]);
-    if (!warnedShortForwardedFor) {
+    // No header at all is the platform's own health check talking to us directly; only a header that
+    // is present but too short means the hop count is misconfigured.
+    if (hops.length > 0 && !warnedShortForwardedFor) {
       // Falling back to the socket address puts every player behind one proxy IP (shared limits)
       warnedShortForwardedFor = true;
       console.warn(
