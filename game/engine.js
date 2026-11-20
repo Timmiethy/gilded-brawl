@@ -1435,9 +1435,11 @@ function pruneLeaderboardForNewEntry(state) {
 
 // Joins a new player, or switches hero for an existing one. Switching keeps HP ratio, life state,
 // cooldowns and position, so re-submitting the hero dialog can never heal, revive, or reset skills.
+// Request handlers only read and change the world; server.js's 30 Hz loop is the only thing that
+// advances time (stepping per request too ran physics ~86×/s instead of 30 with 4 players).
 export function joinPlayer({ session, name, charId, ip }) {
   const now = Date.now();
-  const state = stepEngine(now);
+  const state = getState();
   const safeName = sanitizeName(name);
   const charDef = CHARACTER_MAP[charId] || CHARACTERS[0];
 
@@ -1552,7 +1554,7 @@ export function joinPlayer({ session, name, charId, ip }) {
 }
 
 export function leavePlayer(session) {
-  const state = stepEngine(Date.now());
+  const state = getState();
   const id = state.sessions.get(session);
   if (id) state.players.delete(id);
   return { ok: true };
@@ -1566,7 +1568,7 @@ function finiteOr(v, fallback) {
 export function handleTick(payload) {
   const now = Date.now();
   const { session, ix, iy, cx, cy, fseq, moving, aim, actions, lastEventId } = payload || {};
-  const state = stepEngine(now);
+  const state = getState();
   const id = state.sessions.get(session);
   const player = id ? state.players.get(id) : null;
 

@@ -99,3 +99,29 @@ Status effects: **slow** (also enforced by the server's movement budget), **hast
 - **[`public/js/render/overlay.js`](../public/js/render/overlay.js)** and **[`minimap.js`](../public/js/render/minimap.js):** 2D nameplates, HP/shield bars, pop-up damage numbers above the 3D view; the world minimap.
 - **[`public/vendor/three/`](../public/vendor/three/):** three.js (pinned in `package.json`), copied from `node_modules` by `npm run vendor:three`. The script rewrites the addons' bare `'three'` imports to a path, because the strict CSP forbids an inline import map.
 - **[`public/js/audio.js`](../public/js/audio.js):** Lightweight procedural Web Audio API 16-bit synthesizer for attack, skill, hit, heal, KO, and round-horn sound effects with mute toggle.
+
+---
+
+## 5. Deployment
+
+The game runs as **one** always-on Node process (`node server.js`) on Render: service `gilded-brawl` (`srv-dc05oft9fdbs73cki1v0`), https://gilded-brawl.onrender.com. It auto-deploys from `main`.
+
+It must be exactly one instance (see *Exactly one game process*). Created with the Render CLI:
+
+```bash
+render services create --type web_service --name gilded-brawl \
+  --repo https://github.com/Timmiethy/gilded-brawl --branch main \
+  --runtime node --plan free --region singapore --num-instances 1 \
+  --build-command "npm install --omit=dev" --start-command "node server.js" \
+  --health-check-path /api/status \
+  --env-var TRUST_PROXY_HOPS=3 --env-var NODE_VERSION=22
+```
+
+Receipts for the settings:
+
+- **Region `singapore`:** median TCP connect time from the developer's network was 31 ms to Singapore, against 239–270 ms to Oregon, Ohio, Virginia and Frankfurt.
+- **`TRUST_PROXY_HOPS=3`:** measured on the live service with a header echo. A request arrives with `X-Forwarded-For: <client-supplied…>, <client>, <Cloudflare edge>, <Render internal>`. `1` picked the Render internal address (all players would share one address), and `2` picked the Cloudflare edge address (it changes per request, so the per-network limit never triggers). Check after any platform change: the 5th join from one network must fail with an error that names your real IP.
+- **Free plan limits:** the service sleeps after 15 minutes without traffic (the world resets; the next visitor waits about a minute), and it has 0.1 CPU (100 ms of CPU per second). Measured on an Apple M3, the server uses 5 ms/s idle and 41 ms/s with 4 players polling at 14 Hz, mostly per-request HTTP handling and snapshot JSON. Render's shared cores are slower, so a handful of players can reach the limit and replies stall. Measured on the idle free service, a reply takes a median 164–179 ms with spikes up to about 2 s, against 31 ms of network. A paid instance or a WebSocket transport (one connection per player, server push, no per-poll HTTP overhead) is the fix when that matters.
+
+The old Vercel project only redirects to this host (`redirects` in `vercel.json`): Vercel Functions run several instances, which split players into different worlds.
+
