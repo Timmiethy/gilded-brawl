@@ -64,6 +64,16 @@ if (playerName) nameInput.value = playerName;
 let isJoined = false;
 let rejoinInFlight = null;
 let warnedRateLimit = false;
+
+// Connection watchdog. Receipt: the slowest healthy reply measured on the free Render plan was
+// 4.4 s, so 6 s without any successful reply is a tripwire, not a hiccup — tell the player.
+const CONNECTION_LOST_MS = 6000;
+let lastServerOkAt = performance.now();
+let lastServerError = '';
+function markServerOk() {
+  lastServerOkAt = performance.now();
+  lastServerError = '';
+}
 let latestWorld = null;
 let lastEventId = 0;
 let syncInFlight = false;
@@ -257,6 +267,7 @@ async function joinArena(name, charId) {
     throw new Error(body.error || `Join failed (HTTP ${res.status})`);
   }
   const snap = await res.json();
+  markServerOk();
   joinErrorEl.hidden = true;
   isJoined = true;
   playerName = name;
@@ -645,7 +656,10 @@ async function sendTickNow(immediateActions = []) {
       warnedRateLimit = true;
       console.warn('Gilded Brawl:', (await res.json().catch(() => ({}))).error || 'rate limited');
     }
-    if (!res.ok) return;
+    if (!res.ok) {
+      lastServerError = `Server replied HTTP ${res.status}.`;
+      return;
+    }
     const snap = await res.json();
     // Check ordering after the body arrives: responses can finish parsing out of order
     if (seq < lastAppliedTickSeq) return;
@@ -653,15 +667,19 @@ async function sendTickNow(immediateActions = []) {
     if (!snap.joined && isJoined && playerName) {
       // Timed out server-side (or server restarted): join again, once, however many ticks notice it
       rejoinInFlight ??= joinArena(playerName, selectedCharId)
-        .catch((err) => console.warn('Gilded Brawl rejoin failed:', err.message))
+        .catch((err) => {
+          lastServerError = `Could not rejoin: ${err.message}`;
+        })
         .finally(() => {
           rejoinInFlight = null;
         });
       return;
     }
+    markServerOk();
     applySnapshot(snap, false);
-  } catch {
-    // Transient network hiccup — next tick will recover
+  } catch (err) {
+    // One failed poll is a hiccup; the watchdog shows the banner if they keep failing
+    lastServerError = `Network error: ${err.message}.`;
   }
 }
 
@@ -671,7 +689,12 @@ async function syncWithServer() {
   try {
     if (!isJoined) {
       const res = await fetch(`/api/status?since=${lastEventId}`);
-      if (res.ok) applySnapshot(await res.json(), false);
+      if (res.ok) {
+        markServerOk();
+        applySnapshot(await res.json(), false);
+      } else {
+        lastServerError = `Server replied HTTP ${res.status}.`;
+      }
       return;
     }
 
@@ -681,8 +704,8 @@ async function syncWithServer() {
     }
 
     await sendTickNow([]);
-  } catch {
-    // Transient network hiccup — next tick will recover
+  } catch (err) {
+    lastServerError = `Network error: ${err.message}.`;
   } finally {
     syncInFlight = false;
   }
@@ -1052,6 +1075,28 @@ function frame(now) {
 
   requestAnimationFrame(frame);
 }
+
+const connectionBanner = document.getElementById('connection-banner');
+const connectionDetail = document.getElementById('connection-detail');
+document.getElementById('btn-reload').addEventListener('click', () => location.reload());
+let showingLostInDialog = false;
+setInterval(() => {
+  const lost = performance.now() - lastServerOkAt > CONNECTION_LOST_MS;
+  const detail = lastServerError || 'No reply from the server.';
+  // A modal <dialog> sits in the top layer above any z-index, so while it is open the message goes
+  // into the dialog's own error line instead of the banner
+  const inDialog = lost && dialogEl.open;
+  connectionBanner.hidden = !lost || inDialog;
+  if (lost) connectionDetail.textContent = detail;
+  if (inDialog) {
+    joinErrorEl.textContent = `Lost connection to the game server. ${detail} Reload the page if this lasts.`;
+    joinErrorEl.hidden = false;
+    showingLostInDialog = true;
+  } else if (showingLostInDialog) {
+    joinErrorEl.hidden = true;
+    showingLostInDialog = false;
+  }
+}, 500);
 
 // Boot
 renderRoster();
