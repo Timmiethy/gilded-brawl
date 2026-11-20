@@ -14,9 +14,12 @@ const RATE_LIMITS = {
   other: { max: 30, windowMs: 1000 },
 };
 
-// Proxy headers are client-controlled unless a trusted proxy overwrites them. Vercel's edge does;
-// a bare `node server.js` has no proxy, so there we trust only the socket address.
-const TRUST_PROXY = Boolean(process.env.VERCEL) || process.env.TRUST_PROXY === '1';
+// Number of trusted reverse proxies in front of this server (the Express "trust proxy" model).
+// Each proxy appends the address it received from to X-Forwarded-For, so the real client is the
+// entry added by the outermost trusted proxy: the TRUST_PROXY_HOPS-th entry from the right.
+// Everything to the left of it is client-controlled. 0 (a bare `node server.js`) = socket address only.
+const TRUST_PROXY_HOPS = Number(process.env.TRUST_PROXY_HOPS ?? (process.env.VERCEL ? 1 : 0));
+let warnedShortForwardedFor = false;
 
 function getRateLimiter() {
   if (!globalThis.__GILDED_BRAWL_RL__) {
@@ -45,11 +48,18 @@ function normalizeIp(raw) {
 }
 
 function getClientIp(req) {
-  if (TRUST_PROXY) {
-    const realIp = req.headers['x-real-ip'];
-    if (typeof realIp === 'string' && realIp.length > 0) return normalizeIp(realIp);
+  if (TRUST_PROXY_HOPS > 0) {
     const xff = req.headers['x-forwarded-for'];
-    if (typeof xff === 'string' && xff.length > 0) return normalizeIp(xff.split(',')[0]);
+    const hops = typeof xff === 'string' ? xff.split(',').map((s) => s.trim()).filter(Boolean) : [];
+    if (hops.length >= TRUST_PROXY_HOPS) return normalizeIp(hops[hops.length - TRUST_PROXY_HOPS]);
+    if (!warnedShortForwardedFor) {
+      // Falling back to the socket address puts every player behind one proxy IP (shared limits)
+      warnedShortForwardedFor = true;
+      console.warn(
+        `[api] TRUST_PROXY_HOPS=${TRUST_PROXY_HOPS} but X-Forwarded-For has ${hops.length} entries; ` +
+          'using the socket address. Lower TRUST_PROXY_HOPS to the real number of proxies.'
+      );
+    }
   }
   return normalizeIp(req.socket?.remoteAddress);
 }

@@ -1475,7 +1475,7 @@ export function joinPlayer({ session, name, charId, ip }) {
     }
     if (sameIpCount >= MAX_PLAYERS_PER_IP) {
       return {
-        error: `Too many active players from this network (max_players_per_ip=${MAX_PLAYERS_PER_IP}).`,
+        error: `Too many active players from this network ${ip} (max_players_per_ip=${MAX_PLAYERS_PER_IP}).`,
         status: 429,
       };
     }

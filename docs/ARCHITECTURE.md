@@ -11,7 +11,7 @@ Players roam a seamless `2400 × 2400` open-world map divided into 4 distinct bi
 ## 2. How It Works (End-to-End Architecture)
 
 ```text
-Browser Client (60 FPS)                       Node.js / Vercel Server (RAM)
+Browser Client (60 FPS)                       One Node.js game process (RAM)
 ┌──────────────────────────────────┐          ┌──────────────────────────────────┐
 │ WASD / Mouse / Q-E-R Input       │          │ api/game.js                      │
 │  ├─ Instant 0ms local movement   │          │  ├─ Per-IP sliding rate limiter  │
@@ -31,7 +31,7 @@ Browser Client (60 FPS)                       Node.js / Vercel Server (RAM)
 - **Client identity (session key vs. public id):** Each browser tab generates a secret `session` key (`crypto.randomUUID()`, kept in `sessionStorage`). It is a bearer credential: only the owning tab sends it, and the server never returns it. The server maps it to a public player id (`pl1`, `pl2`, …) that snapshots, events, and the leaderboard use, and returns the caller's own id as `selfId`. A tab created with *Duplicate tab* (which copies `sessionStorage`) detects the shared key over a `BroadcastChannel` and takes a fresh one, so every tab is an independent player.
 - **60 FPS movement without rubber-banding:** The client moves the local hero at 60 FPS using the shared obstacle layout (`resolveLocalObstacles`) and reports `(cx, cy)` on `/api/tick`. The server checks movement with a token-bucket movement budget: travel allowance grows with real elapsed time (`speed × speedMult × elapsed`, banked up to 0.6s + 48px slack), never with the number of ticks, so faster ticks cannot move a player faster. The server forces position overrides (`fseq` / `force`) only for server-authoritative displacements (dashes, blinks, hooks, knockbacks, gravity wells, respawns, new rounds). Each tick echoes the last `fseq` the client applied; the server ignores `(cx, cy)` until that ack matches, so in-flight ticks cannot drag a player back after a forced move. Dash paths and collisions come from one shared module (`public/shared/physics.js`), so the predicted dash ends where the server's dash ends.
 - **0ms skill & click responsiveness:** Clicking or pressing `Q`/`E`/`R` immediately runs `predictActionLocally()` (spawning local VFX, SFX, cooldown sweep, and predicted projectiles) and fires a non-blocking `POST /api/tick` without waiting behind background 70ms polling ticks. Monotonic `tickSeq` numbering discards stale out-of-order responses, and server events tagged with `actorId` avoid duplicating locally predicted VFX.
-- **Vercel serverless compatibility:** Because the entire simulation advances via wall-clock delta-time inside `stepEngine(Date.now())` on every incoming request (in addition to a 30 Hz local `setInterval` in `server.js`), round timers, projectiles, DoT zones, and delayed blasts stay accurate in both local Node and Vercel Node.js runtimes.
+- **Exactly one game process:** The world lives in the memory of one long-running Node process (`server.js`, which also steps the simulation at 30 Hz). Every player must reach that same process. Serverless platforms (for example Vercel Functions) run several short-lived instances, and each one holds its own copy of the world. Players then land in different worlds, and their heroes jump between positions from different worlds on each poll. That happened in production, so the game is hosted on Render as a single always-on web service (see *Deployment*).
 
 ---
 
@@ -68,7 +68,7 @@ Status effects: **slow** (also enforced by the server's movement budget), **hast
 
 ### Rate Limiting & Anti-Abuse Protections
 - **Per-IP fixed-window rate limits:** `/api/tick` (120/s), `/api/status` (60/s), `/api/join` (10/10s), `/api/leave` (12/10s), any other path (30/s, one shared bucket so path variations cannot mint new buckets). A `429` names the limit and sends `Retry-After`. Receipts for each number are in `api/game.js`.
-- **Trusted client IP:** `X-Forwarded-For` / `X-Real-IP` are trusted only behind a proxy that overwrites them (Vercel, or `TRUST_PROXY=1`); a bare `node server.js` uses the socket address. IPv6 clients are grouped by `/64`, because one subscriber owns the whole prefix.
+- **Trusted client IP:** `TRUST_PROXY_HOPS` is the number of trusted reverse proxies in front of the server (the Express "trust proxy" model). Each proxy appends to `X-Forwarded-For`, so the client address is the `TRUST_PROXY_HOPS`-th entry from the right; everything to its left is client-controlled. `0` (a bare `node server.js`) uses the socket address. The per-network limit error names the detected address, so an operator can check the setting. IPv6 clients are grouped by `/64`, because one subscriber owns the whole prefix.
 - **Payload & schema guards:** `4 KB` JSON body cap counted in bytes, checked on `Content-Length` and while streaming (`413`, connection closed); JSON object bodies only; regex-validated `session` (`400`); method checks (`405`); name sanitization; HTML output escaped.
 - **Security headers:** `vercel.json` is the single source; `server.js` reads and applies the same rules locally. CSP has no `'unsafe-inline'` (no inline styles or scripts), plus `object-src 'none'`, `form-action 'self'`, `frame-ancestors 'none'`.
 - **Static files:** the path check requires the resolved path to be `public/` itself or inside `public/` + path separator, so `/../public_other/…` cannot reach sibling folders. Read-stream errors fail only that response.
@@ -80,13 +80,13 @@ Status effects: **slow** (also enforced by the server's movement budget), **hast
 ## 4. Major Files Reference
 
 ### Server & Shared Data
-- **[`server.js`](../server.js):** Zero-dependency Node.js HTTP server (and Vercel entrypoint). Serves static files from `public/`, routes `/api/*` to `api/game.js`, and runs a 30 Hz `stepEngine` loop locally.
+- **[`server.js`](../server.js):** The zero-dependency game server: one Node process that owns the world. Serves `public/` from memory (read and Brotli/gzip-compressed once, `ETag` + revalidation), routes `/api/*` to `api/game.js`, and runs the 30 Hz `stepEngine` loop.
 - **[`api/game.js`](../api/game.js):** Unified API router for `/api/join` (also switches hero), `/api/tick`, `/api/leave`, and `/api/status`. Implements per-IP rate limiting, trusted-IP resolution, 4 KB body size enforcement, JSON parsing, method checks, and `session` validation.
 - **[`game/engine.js`](../game/engine.js):** Authoritative in-RAM simulation singleton (`globalThis.__GILDED_BRAWL_STATE__`). Handles player lifecycle, timeout pruning (12s), movement validation, collision resolution, every skill archetype (ricochet/homing/boomerang projectiles, portals, stasis, barriers, trails, ripples, lock-ons, rewind, stealth), shrines, practice totems, round countdown/intermission transitions, co-winner calculation, leaderboard persistence, and snapshot serialization.
 - **[`public/shared/characters.js`](../public/shared/characters.js):** Shared roster definitions for all 10 champions (base HP, speed, hitbox radius, palette, normal attack, and 3 skills with damage, cooldowns, ranges, and status effects). Imported by both server and client.
 - **[`public/shared/physics.js`](../public/shared/physics.js):** Shared circle-vs-obstacle collision, ricochet contact normals, and dash tracing, imported by both the server simulation and the client prediction.
 - **[`public/shared/map.js`](../public/shared/map.js):** Shared `2400 × 2400` open-world geometry — biome boundaries, 28 circular obstacles, 12 spawn points, 5 healing shrines, 2 practice totems, and round/intermission durations (`90s` / `6s`).
-- **[`vercel.json`](../vercel.json):** Single source of response headers: `Cache-Control: no-store` on `/api/*` and security/CSP headers on all routes. `server.js` applies the same rules locally.
+- **[`vercel.json`](../vercel.json):** Single source of response headers (`Cache-Control: no-store` on `/api/*`; security/CSP headers on all routes), which `server.js` applies. On Vercel it also redirects the old URL to the Render host.
 
 ### Frontend Client
 - **[`public/index.html`](../public/index.html):** Semantic HTML document containing the full-viewport game `<canvas>`, HUD plates (round timer, biome, Champions leaderboard, kill feed, minimap, HP/shield bar, 4-slot skill bar), center-screen callouts, round summary overlay, and native `<dialog>` onboarding/hero-select modal.
