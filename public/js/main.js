@@ -393,7 +393,7 @@ function predictActionLocally(actionKey, aimWorld) {
         k: def.type,
         ox: me.x,
         oy: me.y,
-        life: Math.min(0.45, def.range / def.speed),
+        life: Math.min(0.9, def.range / def.speed),
       });
       sfx.play(isBasic ? 'shoot' : 'spread');
       break;
@@ -418,7 +418,7 @@ function predictActionLocally(actionKey, aimWorld) {
           r: def.radius || 7,
           c: def.color,
           k: 'projectile',
-          life: Math.min(0.45, def.range / def.speed),
+          life: Math.min(0.9, def.range / def.speed),
         });
       }
       sfx.play('spread');
@@ -476,7 +476,7 @@ function predictActionLocally(actionKey, aimWorld) {
     case 'chain_lightning': {
       renderer.pushEventFx({
         type: 'lightning',
-        segments: [{ x1: me.x, y1: me.y, x2: me.x + dirX * Math.min(280, Math.max(140, dist)), y2: me.y + dirY * Math.min(280, Math.max(140, dist)) }],
+        segments: [{ x1: me.x, y1: me.y, x2: me.x + dirX * Math.min(def.range || 680, Math.max(240, dist)), y2: me.y + dirY * Math.min(def.range || 680, Math.max(240, dist)) }],
         color: def.color,
       });
       sfx.play('lightning');
@@ -703,6 +703,7 @@ function applySnapshot(snap, snapImmediate) {
       existing.hit = sp.hit;
       existing.atk = sp.atk;
       existing.orbit = sp.orbit;
+      existing.orbitR = sp.orbitR;
       existing.charId = sp.charId;
       existing.name = sp.name;
       existing.cds = sp.cds;
@@ -853,7 +854,7 @@ function updateHud(snap) {
         <li class="${cls}">
           <span class="lb-rank">${medal}</span>
           <span class="lb-name">${escapeHtml(row.name)}</span>
-          <span class="lb-hp">${row.online ? `${row.hp}hp` : 'off'}</span>
+          <span class="lb-hp">${row.online ? `${row.roundKos || 0}K · ${row.hp}hp` : 'off'}</span>
           <span class="lb-wins">${row.wins}W</span>
         </li>
       `;
@@ -870,16 +871,18 @@ function updateHud(snap) {
     roundOverlay.hidden = false;
     summaryKicker.textContent = `ROUND ${sum.roundNumber} COMPLETE`;
     summaryWinner.textContent = `👑 ${sum.winnerName}`;
-    summarySub.textContent = sum.winnerId
-      ? `Victory with ${sum.winnerHp} / ${sum.winnerMaxHp} HP remaining!`
-      : 'Waiting for challengers...';
+    summarySub.textContent = !sum.winnerId
+      ? 'Waiting for challengers...'
+      : sum.isTie
+        ? `Co-Champions! Tied with ${sum.winnerKos} KOs & ${sum.winnerHp} HP!`
+        : `Victory with ${sum.winnerKos} KOs & ${sum.winnerHp} / ${sum.winnerMaxHp} HP!`;
     summaryCountdown.textContent = Math.max(0, Math.ceil(snap.timeLeft));
     summaryStandings.innerHTML = (sum.standings || [])
       .map(
         (s, i) => `
         <li>
           <span>#${i + 1} ${escapeHtml(s.name)}</span>
-          <span class="tabular">${s.hp} HP · ${s.kos} KO · ${s.damage} dmg</span>
+          <span class="tabular">${s.kos} KO · ${s.hp} HP · ${s.damage} dmg</span>
         </li>
       `
       )

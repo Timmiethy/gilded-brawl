@@ -531,7 +531,7 @@ function castAction(state, player, actionKey, aimX, aimY) {
         for (const tw of targets) {
           if (hitSet.has(tw.ref.id)) continue;
           const d = Math.hypot(tw.x - curX, tw.y - curY);
-          const maxR = segments.length === 0 ? def.range || 340 : 210;
+          const maxR = segments.length === 0 ? def.range || 680 : 420;
           if (d <= maxR) {
             let score = d;
             if (segments.length === 0) {
@@ -559,8 +559,8 @@ function castAction(state, player, actionKey, aimX, aimY) {
         segments.push({
           x1: player.x,
           y1: player.y,
-          x2: player.x + dirX * 220,
-          y2: player.y + dirY * 220,
+          x2: player.x + dirX * 440,
+          y2: player.y + dirY * 440,
         });
       }
       pushEvent(state, { type: 'lightning', actorId: player.id, segments, color: def.color });
@@ -602,30 +602,41 @@ function castAction(state, player, actionKey, aimX, aimY) {
 
 function finishRound(state, now) {
   const active = [...state.players.values()];
+  // Winning condition: most kills (roundKos) wins; if equal, more health (hp) wins; if both equal, tied players win together!
   active.sort((a, b) => {
+    if (b.roundKos !== a.roundKos) return b.roundKos - a.roundKos;
     if (b.hp !== a.hp) return b.hp - a.hp;
-    if (b.roundDamage !== a.roundDamage) return b.roundDamage - a.roundDamage;
-    return a.joinedAt - b.joinedAt;
+    return b.roundDamage - a.roundDamage;
   });
 
-  let winner = null;
+  let winners = [];
   if (active.length > 0) {
-    winner = active[0];
-    const lb = state.leaderboard.get(winner.id);
-    if (lb) {
-      lb.wins += 1;
-      lb.name = winner.name;
-      lb.charId = winner.charId;
+    const top = active[0];
+    winners = active.filter((p) => p.roundKos === top.roundKos && p.hp === top.hp);
+    for (const w of winners) {
+      const lb = state.leaderboard.get(w.id);
+      if (lb) {
+        lb.wins += 1;
+        lb.name = w.name;
+        lb.charId = w.charId;
+      }
     }
   }
 
+  const primary = winners[0] || null;
+  const winnerNameStr = winners.length > 0 ? winners.map((w) => w.name).join(' & ') : 'No Challengers';
+
   state.lastRoundSummary = {
     roundNumber: state.roundNumber,
-    winnerId: winner ? winner.id : null,
-    winnerName: winner ? winner.name : 'No Challengers',
-    winnerCharId: winner ? winner.charId : null,
-    winnerHp: winner ? winner.hp : 0,
-    winnerMaxHp: winner ? winner.maxHp : 0,
+    winnerId: primary ? primary.id : null,
+    winnerIds: winners.map((w) => w.id),
+    winnerNames: winners.map((w) => w.name),
+    winnerName: winnerNameStr,
+    isTie: winners.length > 1,
+    winnerCharId: primary ? primary.charId : null,
+    winnerKos: primary ? primary.roundKos : 0,
+    winnerHp: primary ? primary.hp : 0,
+    winnerMaxHp: primary ? primary.maxHp : 0,
     standings: active.slice(0, 6).map((p) => ({
       id: p.id,
       name: p.name,
@@ -646,6 +657,7 @@ function finishRound(state, now) {
   pushEvent(state, {
     type: 'round_end',
     winnerName: state.lastRoundSummary.winnerName,
+    winnerKos: state.lastRoundSummary.winnerKos,
     winnerHp: state.lastRoundSummary.winnerHp,
     roundNumber: state.roundNumber,
   });
@@ -1162,15 +1174,20 @@ export function buildSnapshot(state, selfId, sinceEventId = 0) {
   const now = Date.now();
   const timeLeft = Math.max(0, (state.phaseEndAt - now) / 1000);
 
-  // Determine current HP leader
-  let leaderId = null;
-  let maxHpFound = -1;
+  // Determine current round leader(s): most KOs, tie-broken by HP (all tied players share the crown)
+  let bestKos = -1;
+  let bestHp = -1;
   for (const p of state.players.values()) {
-    if (p.hp > maxHpFound) {
-      maxHpFound = p.hp;
-      leaderId = p.id;
+    if (p.roundKos > bestKos || (p.roundKos === bestKos && p.hp > bestHp)) {
+      bestKos = p.roundKos;
+      bestHp = p.hp;
     }
   }
+  const leaderIds = [];
+  for (const p of state.players.values()) {
+    if (p.roundKos === bestKos && p.hp === bestHp) leaderIds.push(p.id);
+  }
+  const leaderId = leaderIds[0] || null;
 
   const players = [];
   for (const p of state.players.values()) {
@@ -1184,6 +1201,7 @@ export function buildSnapshot(state, selfId, sinceEventId = 0) {
       moving: p.moving,
       hp: p.hp,
       maxHp: p.maxHp,
+      kos: p.roundKos,
       shield: Math.round(p.shield),
       alive: p.alive,
       respawn: Math.round(p.respawnTimer * 10) / 10,
@@ -1192,6 +1210,7 @@ export function buildSnapshot(state, selfId, sinceEventId = 0) {
       hit: p.hitFlash > 0,
       atk: p.attackAnim > 0,
       orbit: p.orbitTimer > 0 ? Math.round(p.orbitAngle * 100) / 100 : null,
+      orbitR: p.orbitTimer > 0 ? p.orbitRadius || 144 : undefined,
       fseq: p.forcedSeq || 1,
       force: now < (p.forceSyncUntil || 0),
       cds:
@@ -1215,6 +1234,7 @@ export function buildSnapshot(state, selfId, sinceEventId = 0) {
         charId: entry.charId,
         wins: entry.wins,
         kos: entry.kos,
+        roundKos: live ? live.roundKos : 0,
         online: !!live,
         hp: live ? live.hp : 0,
         maxHp: live ? live.maxHp : 0,
@@ -1223,6 +1243,7 @@ export function buildSnapshot(state, selfId, sinceEventId = 0) {
     .sort((a, b) => {
       if (b.wins !== a.wins) return b.wins - a.wins;
       if (b.online !== a.online) return Number(b.online) - Number(a.online);
+      if (b.roundKos !== a.roundKos) return b.roundKos - a.roundKos;
       if (b.hp !== a.hp) return b.hp - a.hp;
       return b.kos - a.kos;
     })
@@ -1237,6 +1258,7 @@ export function buildSnapshot(state, selfId, sinceEventId = 0) {
     phase: state.phase,
     timeLeft: Math.round(timeLeft * 10) / 10,
     leaderId,
+    leaderIds,
     playerCount: state.players.size,
     players,
     projectiles: state.projectiles.map((pr) => {

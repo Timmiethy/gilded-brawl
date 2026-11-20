@@ -262,9 +262,12 @@ export class ArenaRenderer {
     for (const p of renderPlayers.values()) {
       if (!p.alive) continue;
       if (this.inView(p.x, p.y, 120)) {
+        const isLeader = Array.isArray(world?.leaderIds)
+          ? world.leaderIds.includes(p.id)
+          : p.id === world?.leaderId;
         drawList.push({
           y: p.y,
-          draw: () => this.drawPlayer(ctx, p, p.id === selfId, p.id === world?.leaderId, nowSec),
+          draw: () => this.drawPlayer(ctx, p, p.id === selfId, isLeader, nowSec),
         });
       }
     }
@@ -572,10 +575,11 @@ export class ArenaRenderer {
 
     // Orbiting spectral hounds (Tibo)
     if (p.orbit !== null && p.orbit !== undefined) {
+      const orbitR = p.orbitR || 144;
       for (let i = 0; i < 2; i++) {
         const a = p.orbit + i * Math.PI;
-        const hx = p.x + Math.cos(a) * 72;
-        const hy = p.y + Math.sin(a) * 72;
+        const hx = p.x + Math.cos(a) * orbitR;
+        const hy = p.y + Math.sin(a) * orbitR;
         ctx.save();
         ctx.fillStyle = '#fff59d';
         ctx.shadowColor = '#ffd54f';
@@ -947,9 +951,21 @@ export class ArenaRenderer {
     for (const p of renderPlayers.values()) {
       if (!p.alive) continue;
       const isSelf = p.id === selfId;
-      m.fillStyle = isSelf ? '#fff59d' : p.id === world?.leaderId ? '#ffd54f' : '#ff5252';
+      const isLeader = Array.isArray(world?.leaderIds)
+        ? world.leaderIds.includes(p.id)
+        : p.id === world?.leaderId;
+      const px = p.x * scale;
+      const py = p.y * scale;
+      if (!isSelf && isLeader) {
+        m.strokeStyle = '#ffd54f';
+        m.lineWidth = 1.5;
+        m.beginPath();
+        m.arc(px, py, 5, 0, Math.PI * 2);
+        m.stroke();
+      }
+      m.fillStyle = isSelf ? '#fff59d' : '#ff5252';
       m.beginPath();
-      m.arc(p.x * scale, p.y * scale, isSelf ? 4 : 3, 0, Math.PI * 2);
+      m.arc(px, py, isSelf ? 4 : 3, 0, Math.PI * 2);
       m.fill();
     }
   }
