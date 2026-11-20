@@ -39,5 +39,12 @@
         }
       ]
     }
+  ],
+  "redirects": [
+    {
+      "source": "/(.*)",
+      "destination": "https://gilded-brawl.onrender.com/$1",
+      "permanent": false
+    }
   ]
 }

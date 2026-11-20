@@ -2,7 +2,7 @@
 
 A 3D open-world PvP multiplayer browser arena (three.js / WebGL). Zero login — enter a name, pick one of 10 heroes (a clockwork wren, a lantern ghost, a cactus gunslinger, an origami ronin, a jellyfish astronomer, a pocket thundercloud, a teacup knight, a mushroom alchemist, a vending-machine golem, and a wandering lighthouse), and jump into 90-second PvP rounds.
 
-- **Live Game:** https://agile-krypton-nuen60z-timmiethys-projects.vercel.app
+- **Live Game:** https://gilded-brawl.onrender.com (free plan: after 15 minutes with no visitors the server sleeps, and the next visit waits about a minute while it wakes)
 - **Full Technical & Architecture Docs:** [docs/ARCHITECTURE.md](./docs/ARCHITECTURE.md)
 
 ## Quick Start

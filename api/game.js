@@ -1,5 +1,5 @@
 // Unified API handler with per-IP rate limiting, payload caps, and input validation
-import { joinPlayer, leavePlayer, handleTick, stepEngine, buildSnapshot } from '../game/engine.js';
+import { joinPlayer, leavePlayer, handleTick, getState, buildSnapshot } from '../game/engine.js';
 
 const MAX_BODY_BYTES = 4096; // 4 KB strict limit to prevent memory abuse
 
@@ -196,7 +196,7 @@ export default async function handler(req, res) {
 
   try {
     if (action === 'status') {
-      const state = stepEngine(Date.now());
+      const state = getState();
       const since = Number(url.searchParams.get('since') || 0);
       return sendJson(res, 200, buildSnapshot(state, '', Number.isFinite(since) ? since : 0));
     }
