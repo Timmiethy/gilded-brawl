@@ -62,11 +62,14 @@ let isJoined = false;
 let latestWorld = null;
 let lastEventId = 0;
 let syncInFlight = false;
-let flushNeeded = false;
+let lastAppliedTickSeq = 0;
+let nextTickSeq = 1;
 let pendingActions = [];
 let lastLeaderboardHtml = '';
 const renderPlayers = new Map(); // id -> smoothly interpolated player state
 const renderProjectiles = new Map(); // id -> smoothly extrapolated projectile state
+let localProjSeq = 1;
+let lastLocalDashAt = 0;
 
 // Input state
 const keys = new Set();
@@ -348,21 +351,169 @@ function flashSlot(actionKey) {
   btn.classList.add('cast-flash');
 }
 
+function predictActionLocally(actionKey, aimWorld) {
+  const me = renderPlayers.get(CLIENT_ID);
+  if (!me || !me.alive || latestWorld?.phase !== 'playing') return;
+  const ch = CHARACTER_MAP[me.charId] || CHARACTERS[0];
+  const isBasic = actionKey === 'basic';
+  const skillIdx = actionKey === 'skill0' ? 0 : actionKey === 'skill1' ? 1 : actionKey === 'skill2' ? 2 : -1;
+  const def = isBasic ? ch.basic : ch.skills[skillIdx];
+  if (!def) return;
+
+  const cdKey = isBasic ? 'basic' : `s${skillIdx}`;
+  localCds[cdKey] = def.cooldown;
+  me.atk = true;
+  setTimeout(() => {
+    const cur = renderPlayers.get(CLIENT_ID);
+    if (cur) cur.atk = false;
+  }, 160);
+
+  const dx = aimWorld.x - me.x;
+  const dy = aimWorld.y - me.y;
+  const angle = Math.atan2(dy, dx);
+  const dirX = Math.cos(angle);
+  const dirY = Math.sin(angle);
+  const dist = Math.hypot(dx, dy);
+
+  switch (def.type) {
+    case 'projectile':
+    case 'explosive_proj':
+    case 'hook': {
+      const id = `loc_${localProjSeq++}`;
+      renderProjectiles.set(id, {
+        id,
+        local: true,
+        ownerId: CLIENT_ID,
+        x: me.x + dirX * (ch.radius + 8),
+        y: me.y + dirY * (ch.radius + 8),
+        vx: dirX * def.speed,
+        vy: dirY * def.speed,
+        r: def.radius || 8,
+        c: def.color,
+        k: def.type,
+        ox: me.x,
+        oy: me.y,
+        life: Math.min(0.45, def.range / def.speed),
+      });
+      sfx.play(isBasic ? 'shoot' : 'spread');
+      break;
+    }
+    case 'spread_proj': {
+      const count = def.count || 3;
+      const spread = def.spread || 0.4;
+      for (let i = 0; i < count; i++) {
+        const frac = count === 1 ? 0 : i / (count - 1) - 0.5;
+        const a = angle + frac * spread;
+        const cx = Math.cos(a);
+        const cy = Math.sin(a);
+        const id = `loc_${localProjSeq++}`;
+        renderProjectiles.set(id, {
+          id,
+          local: true,
+          ownerId: CLIENT_ID,
+          x: me.x + cx * (ch.radius + 8),
+          y: me.y + cy * (ch.radius + 8),
+          vx: cx * def.speed,
+          vy: cy * def.speed,
+          r: def.radius || 7,
+          c: def.color,
+          k: 'projectile',
+          life: Math.min(0.45, def.range / def.speed),
+        });
+      }
+      sfx.play('spread');
+      break;
+    }
+    case 'melee':
+    case 'cone_slam': {
+      renderer.pushEventFx({
+        type: 'slash',
+        x: me.x,
+        y: me.y,
+        angle,
+        range: def.range || 80,
+        arc: def.arc || 1.4,
+        color: def.color,
+        heavy: def.type === 'cone_slam',
+      });
+      sfx.play('slash');
+      break;
+    }
+    case 'dash_strike':
+    case 'blink_strike': {
+      const d = Math.min(def.distance || 220, Math.max(90, dist));
+      const sx = me.x;
+      const sy = me.y;
+      const dest = resolveLocalObstacles(sx + dirX * d, sy + dirY * d, ch.radius);
+      me.x = dest.x;
+      me.y = dest.y;
+      lastLocalDashAt = performance.now();
+      renderer.pushEventFx({ type: 'dash', x1: sx, y1: sy, x2: dest.x, y2: dest.y, color: def.color });
+      sfx.play('dash');
+      break;
+    }
+    case 'nova':
+    case 'shield_pulse':
+    case 'heal_nova': {
+      renderer.pushEventFx({ type: 'nova', x: me.x, y: me.y, r: def.radius || 140, color: def.color });
+      sfx.play(def.type === 'heal_nova' ? 'heal' : 'nova');
+      break;
+    }
+    case 'beam': {
+      const range = def.range || 520;
+      renderer.pushEventFx({
+        type: 'beam',
+        x1: me.x,
+        y1: me.y,
+        x2: me.x + dirX * range,
+        y2: me.y + dirY * range,
+        width: def.width || 40,
+        color: def.color,
+      });
+      sfx.play('beam');
+      break;
+    }
+    case 'chain_lightning': {
+      renderer.pushEventFx({
+        type: 'lightning',
+        segments: [{ x1: me.x, y1: me.y, x2: me.x + dirX * Math.min(280, Math.max(140, dist)), y2: me.y + dirY * Math.min(280, Math.max(140, dist)) }],
+        color: def.color,
+      });
+      sfx.play('lightning');
+      break;
+    }
+    case 'orbit_hounds':
+      me.orbit = me.orbit || 0;
+      sfx.play('heal');
+      break;
+    default: {
+      const clamped = Math.min(dist, def.range || 360);
+      renderer.pushEventFx({
+        type: 'nova',
+        x: me.x + dirX * clamped,
+        y: me.y + dirY * clamped,
+        r: Math.min(60, def.radius || 60),
+        color: def.color,
+      });
+      sfx.play('shoot');
+    }
+  }
+}
+
 function queueAction(actionKey, fromHudClick = false) {
   if (!isJoined || dialogEl.open) return;
   const cdKey = actionKey === 'basic' ? 'basic' : actionKey === 'skill0' ? 's0' : actionKey === 'skill1' ? 's1' : 's2';
-  if (localCds[cdKey] > 0.08) return; // Don't queue while clearly on cooldown
+  if (localCds[cdKey] > 0.05) return;
 
   const aimWorld = getCurrentAimWorld(fromHudClick);
-  pendingActions.push({ key: actionKey, tx: Math.round(aimWorld.x), ty: Math.round(aimWorld.y) });
+  const act = { key: actionKey, tx: Math.round(aimWorld.x), ty: Math.round(aimWorld.y) };
+
+  // 0ms instant client visual/audio/cooldown prediction
+  predictActionLocally(actionKey, aimWorld);
   flashSlot(actionKey);
 
-  // Flush immediately instead of waiting for next 70ms poll!
-  if (!syncInFlight) {
-    syncWithServer();
-  } else {
-    flushNeeded = true;
-  }
+  // Dispatch immediately WITHOUT waiting for any in-flight background poll!
+  sendTickNow([act]);
 }
 
 window.addEventListener('keydown', (e) => {
@@ -453,27 +604,15 @@ function getMoveVector() {
   return { ix, iy };
 }
 
-async function syncWithServer() {
-  if (syncInFlight) return;
-  syncInFlight = true;
+async function sendTickNow(immediateActions = []) {
+  const seq = nextTickSeq++;
+  const { ix, iy } = getMoveVector();
+  const me = renderPlayers.get(CLIENT_ID);
+  const aimWorld = renderer.screenToWorld(mouseScreen.x, mouseScreen.y);
+  const aim = me ? Math.atan2(aimWorld.y - me.y, aimWorld.x - me.x) : 0;
+  const actions = immediateActions.length ? immediateActions : pendingActions.splice(0, 4);
+
   try {
-    if (!isJoined) {
-      // Lightweight spectate snapshot while on onboarding screen
-      const res = await fetch(`/api/status?clientId=${encodeURIComponent(CLIENT_ID)}&since=${lastEventId}`);
-      if (res.ok) applySnapshot(await res.json(), false);
-      return;
-    }
-
-    const { ix, iy } = getMoveVector();
-    const me = renderPlayers.get(CLIENT_ID);
-    const aimWorld = renderer.screenToWorld(mouseScreen.x, mouseScreen.y);
-    const aim = me ? Math.atan2(aimWorld.y - me.y, aimWorld.x - me.x) : 0;
-
-    if (mouseDown && !dialogEl.open) {
-      pendingActions.push({ key: 'basic', tx: Math.round(aimWorld.x), ty: Math.round(aimWorld.y) });
-    }
-
-    const actions = pendingActions.splice(0, 4);
     const res = await fetch('/api/tick', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -489,10 +628,9 @@ async function syncWithServer() {
         lastEventId,
       }),
     });
-
-    if (res.ok) {
+    if (res.ok && seq >= lastAppliedTickSeq) {
+      lastAppliedTickSeq = seq;
       const snap = await res.json();
-      // Auto-rejoin transparently preserving current position if serverless cold-started
       if (!snap.joined && isJoined && playerName) {
         await joinArena(playerName, selectedCharId, true);
         return;
@@ -501,12 +639,29 @@ async function syncWithServer() {
     }
   } catch {
     // Transient network hiccup — next tick will recover
+  }
+}
+
+async function syncWithServer() {
+  if (syncInFlight) return;
+  syncInFlight = true;
+  try {
+    if (!isJoined) {
+      const res = await fetch(`/api/status?clientId=${encodeURIComponent(CLIENT_ID)}&since=${lastEventId}`);
+      if (res.ok) applySnapshot(await res.json(), false);
+      return;
+    }
+
+    if (mouseDown && !dialogEl.open && localCds.basic <= 0.05) {
+      queueAction('basic', false);
+      return;
+    }
+
+    await sendTickNow([]);
+  } catch {
+    // Transient network hiccup — next tick will recover
   } finally {
     syncInFlight = false;
-    if (flushNeeded) {
-      flushNeeded = false;
-      syncWithServer();
-    }
   }
 }
 
@@ -554,12 +709,21 @@ function applySnapshot(snap, snapImmediate) {
       existing.force = sp.force;
 
       if (sp.id === CLIENT_ID) {
-        if (sp.cds) localCds = { ...sp.cds };
-        // Only snap/force-move self on server-authoritative displacements (dash, blink, hook, respawn, new round, knockback)
+        if (sp.cds) {
+          // Keep optimistic cooldown if a cast was just sent so CD bar never flickers back to 0
+          for (const k of ['basic', 's0', 's1', 's2']) {
+            if (sp.cds[k] > 0.05 || localCds[k] <= 0.15) {
+              localCds[k] = sp.cds[k];
+            }
+          }
+        }
+        // Only snap/force-move self on server-authoritative displacements (skip echo right after our own predicted dash)
         if ((sp.fseq || 1) !== lastForcedSeq) {
           lastForcedSeq = sp.fseq || 1;
-          existing.x = sp.x;
-          existing.y = sp.y;
+          if (performance.now() - lastLocalDashAt > 450 || Math.hypot(existing.x - sp.x, existing.y - sp.y) > 260) {
+            existing.x = sp.x;
+            existing.y = sp.y;
+          }
         } else if (sp.force) {
           existing.x += (sp.x - existing.x) * 0.45;
           existing.y += (sp.y - existing.y) * 0.45;
@@ -574,11 +738,20 @@ function applySnapshot(snap, snapImmediate) {
     if (!seen.has(id)) renderPlayers.delete(id);
   }
 
-  // Reconcile projectiles smoothly (never snap backwards!)
+  // Reconcile projectiles smoothly (replace local predicted ones once server confirms)
   const seenProj = new Set();
   if (Array.isArray(snap.projectiles)) {
     for (const pr of snap.projectiles) {
       seenProj.add(pr.id);
+      if (pr.ownerId === CLIENT_ID) {
+        // Remove any matching local predicted projectile so we don't draw double
+        for (const [lid, lpr] of renderProjectiles.entries()) {
+          if (lpr.local && lpr.c === pr.c) {
+            renderProjectiles.delete(lid);
+            break;
+          }
+        }
+      }
       const existing = renderProjectiles.get(pr.id);
       if (!existing) {
         renderProjectiles.set(pr.id, { ...pr });
@@ -587,7 +760,6 @@ function applySnapshot(snap, snapImmediate) {
         existing.vy = pr.vy;
         existing.ox = pr.ox;
         existing.oy = pr.oy;
-        // Only nudge gently if drifted far; otherwise let smooth 60 FPS extrapolation run
         if (Math.hypot(existing.x - pr.x, existing.y - pr.y) > 95) {
           existing.x = pr.x;
           existing.y = pr.y;
@@ -595,13 +767,22 @@ function applySnapshot(snap, snapImmediate) {
       }
     }
   }
-  for (const id of renderProjectiles.keys()) {
-    if (!seenProj.has(id)) renderProjectiles.delete(id);
+  for (const [id, pr] of renderProjectiles.entries()) {
+    if (!pr.local && !seenProj.has(id)) renderProjectiles.delete(id);
   }
 
-  // Process combat events
+  // Process combat events (skip duplicate VFX/SFX already predicted locally for self)
   if (Array.isArray(snap.events)) {
     for (const evt of snap.events) {
+      const selfPredicted =
+        evt.actorId === CLIENT_ID &&
+        (evt.type === 'slash' ||
+          evt.type === 'nova' ||
+          evt.type === 'beam' ||
+          evt.type === 'lightning' ||
+          evt.type === 'dash');
+      if (selfPredicted) continue;
+
       renderer.pushEventFx(evt);
       if (evt.type === 'ko') {
         pushKillToast(`☠ ${evt.attackerName} KO'd ${evt.victimName}`);
@@ -785,10 +966,14 @@ function frame(now) {
     updateCdSlot('s2', localCds.s2, ch.skills[2].cooldown);
   }
 
-  // Extrapolate projectiles smoothly at 60 FPS
-  for (const pr of renderProjectiles.values()) {
+  // Extrapolate projectiles smoothly at 60 FPS (and expire local predicted ones)
+  for (const [id, pr] of renderProjectiles.entries()) {
     pr.x += pr.vx * dt;
     pr.y += pr.vy * dt;
+    if (pr.local) {
+      pr.life -= dt;
+      if (pr.life <= 0) renderProjectiles.delete(id);
+    }
   }
 
   renderer.updateFx(dt);

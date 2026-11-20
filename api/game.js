@@ -3,7 +3,7 @@ import { joinPlayer, leavePlayer, handleTick, stepEngine, buildSnapshot } from '
 
 const MAX_BODY_BYTES = 4096; // 4 KB strict limit to prevent memory abuse
 const RATE_LIMITS = {
-  tick: { max: 40, windowMs: 1000 }, // Supports ~2-3 tabs on same IP + instant skill flushes
+  tick: { max: 55, windowMs: 1000 }, // Supports multiple tabs on same IP + instant action sends
   join: { max: 10, windowMs: 10_000 },
   switch: { max: 10, windowMs: 10_000 },
   status: { max: 30, windowMs: 1000 },

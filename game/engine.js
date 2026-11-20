@@ -351,6 +351,7 @@ function castAction(state, player, actionKey, aimX, aimY) {
       }
       pushEvent(state, {
         type: 'slash',
+        actorId: player.id,
         x: player.x,
         y: player.y,
         angle,
@@ -415,6 +416,7 @@ function castAction(state, player, actionKey, aimX, aimY) {
       }
       pushEvent(state, {
         type: 'dash',
+        actorId: player.id,
         playerId: player.id,
         x1: startX,
         y1: startY,
@@ -454,7 +456,7 @@ function castAction(state, player, actionKey, aimX, aimY) {
           });
         }
       }
-      pushEvent(state, { type: 'nova', x: player.x, y: player.y, r, color: def.color });
+      pushEvent(state, { type: 'nova', actorId: player.id, x: player.x, y: player.y, r, color: def.color });
       break;
     }
 
@@ -561,7 +563,7 @@ function castAction(state, player, actionKey, aimX, aimY) {
           y2: player.y + dirY * 220,
         });
       }
-      pushEvent(state, { type: 'lightning', segments, color: def.color });
+      pushEvent(state, { type: 'lightning', actorId: player.id, segments, color: def.color });
       break;
     }
 
@@ -585,6 +587,7 @@ function castAction(state, player, actionKey, aimX, aimY) {
       }
       pushEvent(state, {
         type: 'beam',
+        actorId: player.id,
         x1: player.x,
         y1: player.y,
         x2: endX,
@@ -1240,6 +1243,7 @@ export function buildSnapshot(state, selfId, sinceEventId = 0) {
       const owner = pr.kind === 'hook' ? state.players.get(pr.ownerId) : null;
       return {
         id: pr.id,
+        ownerId: pr.ownerId,
         x: Math.round(pr.x),
         y: Math.round(pr.y),
         vx: Math.round(pr.vx),
