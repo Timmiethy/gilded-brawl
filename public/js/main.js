@@ -1,21 +1,21 @@
 // Gilded Brawl — Client Controller, 60 FPS Loop, Smooth Interpolation & Server Sync
 import { CHARACTERS, CHARACTER_MAP } from '/shared/characters.js';
-import { getBiomeAt, BIOMES, WORLD_SIZE, OBSTACLES } from '/shared/map.js';
+import { getBiomeAt, BIOMES } from '/shared/map.js';
+import { resolveCircleObstacles, dashDistance, traceDash } from '/shared/physics.js';
 import { getHeroSprites } from './sprites.js';
 import { ArenaRenderer } from './renderer.js';
 import { sfx } from './audio.js';
 
-// Each browser tab gets a unique clientId so every browser client is counted as a player!
-function getClientId() {
-  let id = sessionStorage.getItem('gilded_brawl_client_id');
-  if (!id) {
-    id = `c_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 9)}`;
-    sessionStorage.setItem('gilded_brawl_client_id', id);
-  }
-  return id;
+// Each browser tab holds a secret session key (a bearer credential — never shown to other players).
+// The server answers with our public player id (`selfId`), which is what every snapshot refers to.
+const SESSION_STORAGE_KEY = 'gilded_brawl_session';
+function newSession() {
+  const s = crypto.randomUUID();
+  sessionStorage.setItem(SESSION_STORAGE_KEY, s);
+  return s;
 }
-
-const CLIENT_ID = getClientId();
+let SESSION = sessionStorage.getItem(SESSION_STORAGE_KEY) || newSession();
+let selfId = null;
 const SYNC_MS = 70; // ~14 Hz authoritative server tick
 
 // DOM references
@@ -29,6 +29,7 @@ const charGridEl = document.getElementById('character-grid');
 const btnCancelSwitch = document.getElementById('btn-cancel-switch');
 const btnSwitchHero = document.getElementById('btn-switch-hero');
 const btnMute = document.getElementById('btn-mute');
+const joinErrorEl = document.getElementById('join-error');
 
 const hudRound = document.getElementById('hud-round');
 const hudBiome = document.getElementById('hud-biome');
@@ -54,11 +55,15 @@ const summaryCountdown = document.getElementById('summary-countdown');
 const renderer = new ArenaRenderer(canvas, minimapCanvas);
 
 // Client state
-let selectedCharId = sessionStorage.getItem('gilded_brawl_char') || CHARACTERS[0].id;
+let selectedCharId = CHARACTER_MAP[sessionStorage.getItem('gilded_brawl_char')]
+  ? sessionStorage.getItem('gilded_brawl_char')
+  : CHARACTERS[0].id;
 let playerName = sessionStorage.getItem('gilded_brawl_name') || '';
 if (playerName) nameInput.value = playerName;
 
 let isJoined = false;
+let rejoinInFlight = null;
+let warnedRateLimit = false;
 let latestWorld = null;
 let lastEventId = 0;
 let syncInFlight = false;
@@ -79,23 +84,17 @@ let mouseDown = false;
 let localCds = { basic: 0, s0: 0, s1: 0, s2: 0 };
 let lastForcedSeq = 0;
 
-function resolveLocalObstacles(x, y, radius) {
-  const margin = 44;
-  let nx = Math.max(margin + radius, Math.min(WORLD_SIZE - margin - radius, x));
-  let ny = Math.max(margin + radius, Math.min(WORLD_SIZE - margin - radius, y));
-  for (const ob of OBSTACLES) {
-    const dx = nx - ob.x;
-    const dy = ny - ob.y;
-    const minD = radius + ob.r;
-    const d2 = dx * dx + dy * dy;
-    if (d2 < minD * minD) {
-      const d = Math.sqrt(d2) || 0.001;
-      const push = minD - d;
-      nx += (dx / d) * push;
-      ny += (dy / d) * push;
-    }
-  }
-  return { x: nx, y: ny };
+// "Duplicate tab" copies sessionStorage, so the copy would share (and fight over) our player.
+// Ask other tabs whether they already own this session; if one does, take a fresh one before joining.
+const tabChannel = typeof BroadcastChannel === 'function' ? new BroadcastChannel('gilded_brawl_tabs') : null;
+if (tabChannel) {
+  tabChannel.onmessage = (e) => {
+    const msg = e.data || {};
+    if (msg.session !== SESSION) return;
+    if (msg.type === 'probe') tabChannel.postMessage({ type: 'taken', session: SESSION });
+    else if (msg.type === 'taken' && !isJoined) SESSION = newSession();
+  };
+  tabChannel.postMessage({ type: 'probe', session: SESSION });
 }
 
 // --- Accessible Validation Sync (validate-input-after-interaction) ---
@@ -249,28 +248,25 @@ function updateRosterSelection() {
 }
 
 // --- Join / Switch Hero API ---
-async function joinArena(name, charId, preservePos = false) {
-  const me = preservePos ? renderPlayers.get(CLIENT_ID) : null;
+async function joinArena(name, charId) {
   const res = await fetch('/api/join', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      clientId: CLIENT_ID,
-      name,
-      charId,
-      x: me ? Math.round(me.x) : undefined,
-      y: me ? Math.round(me.y) : undefined,
-    }),
+    body: JSON.stringify({ session: SESSION, name, charId }),
   });
-  if (!res.ok) throw new Error('Join failed');
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}));
+    throw new Error(body.error || `Join failed (HTTP ${res.status})`);
+  }
   const snap = await res.json();
+  joinErrorEl.hidden = true;
   isJoined = true;
   playerName = name;
   selectedCharId = charId;
   sessionStorage.setItem('gilded_brawl_name', name);
   sessionStorage.setItem('gilded_brawl_char', charId);
 
-  applySnapshot(snap, !preservePos);
+  applySnapshot(snap, true);
   updateHeroHudStatic();
   hudEl.hidden = false;
   btnCancelSwitch.hidden = false;
@@ -307,7 +303,9 @@ formEl.addEventListener('submit', async (e) => {
     await joinArena(trimmed, selectedCharId);
     sfx.play('round_start');
   } catch (err) {
-    console.error(err);
+    // The server names the limit that was hit (arena full, per-network cap, rate limit) — show it
+    joinErrorEl.textContent = err.message;
+    joinErrorEl.hidden = false;
   }
 });
 
@@ -352,7 +350,7 @@ function flashSlot(actionKey) {
 }
 
 function predictActionLocally(actionKey, aimWorld) {
-  const me = renderPlayers.get(CLIENT_ID);
+  const me = renderPlayers.get(selfId);
   if (!me || !me.alive || latestWorld?.phase !== 'playing') return;
   const ch = CHARACTER_MAP[me.charId] || CHARACTERS[0];
   const isBasic = actionKey === 'basic';
@@ -364,7 +362,7 @@ function predictActionLocally(actionKey, aimWorld) {
   localCds[cdKey] = def.cooldown;
   me.atk = true;
   setTimeout(() => {
-    const cur = renderPlayers.get(CLIENT_ID);
+    const cur = renderPlayers.get(selfId);
     if (cur) cur.atk = false;
   }, 160);
 
@@ -383,7 +381,7 @@ function predictActionLocally(actionKey, aimWorld) {
       renderProjectiles.set(id, {
         id,
         local: true,
-        ownerId: CLIENT_ID,
+        ownerId: selfId,
         x: me.x + dirX * (ch.radius + 8),
         y: me.y + dirY * (ch.radius + 8),
         vx: dirX * def.speed,
@@ -410,7 +408,7 @@ function predictActionLocally(actionKey, aimWorld) {
         renderProjectiles.set(id, {
           id,
           local: true,
-          ownerId: CLIENT_ID,
+          ownerId: selfId,
           x: me.x + cx * (ch.radius + 8),
           y: me.y + cy * (ch.radius + 8),
           vx: cx * def.speed,
@@ -441,10 +439,9 @@ function predictActionLocally(actionKey, aimWorld) {
     }
     case 'dash_strike':
     case 'blink_strike': {
-      const d = Math.min(def.distance || 220, Math.max(90, dist));
       const sx = me.x;
       const sy = me.y;
-      const dest = resolveLocalObstacles(sx + dirX * d, sy + dirY * d, ch.radius);
+      const { end: dest } = traceDash(def.type, sx, sy, dirX, dirY, dashDistance(def, dist), ch.radius);
       me.x = dest.x;
       me.y = dest.y;
       lastLocalDashAt = performance.now();
@@ -588,7 +585,7 @@ window.addEventListener('resize', () => renderer.resize());
 
 window.addEventListener('pagehide', () => {
   if (!isJoined) return;
-  const payload = JSON.stringify({ clientId: CLIENT_ID });
+  const payload = JSON.stringify({ session: SESSION });
   navigator.sendBeacon('/api/leave', new Blob([payload], { type: 'application/json' }));
 });
 
@@ -607,7 +604,7 @@ function getMoveVector() {
 async function sendTickNow(immediateActions = []) {
   const seq = nextTickSeq++;
   const { ix, iy } = getMoveVector();
-  const me = renderPlayers.get(CLIENT_ID);
+  const me = renderPlayers.get(selfId);
   const aimWorld = renderer.screenToWorld(mouseScreen.x, mouseScreen.y);
   const aim = me ? Math.atan2(aimWorld.y - me.y, aimWorld.x - me.x) : 0;
   const actions = immediateActions.length ? immediateActions : pendingActions.splice(0, 4);
@@ -617,26 +614,37 @@ async function sendTickNow(immediateActions = []) {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        clientId: CLIENT_ID,
+        session: SESSION,
         ix,
         iy,
         cx: me ? Math.round(me.x * 10) / 10 : undefined,
         cy: me ? Math.round(me.y * 10) / 10 : undefined,
+        fseq: lastForcedSeq, // ack: the server ignores our position until we have seen its latest forced move
         moving: Math.hypot(ix, iy) > 0.1,
         aim,
         actions,
         lastEventId,
       }),
     });
-    if (res.ok && seq >= lastAppliedTickSeq) {
-      lastAppliedTickSeq = seq;
-      const snap = await res.json();
-      if (!snap.joined && isJoined && playerName) {
-        await joinArena(playerName, selectedCharId, true);
-        return;
-      }
-      applySnapshot(snap, false);
+    if (res.status === 429 && !warnedRateLimit) {
+      warnedRateLimit = true;
+      console.warn('Gilded Brawl:', (await res.json().catch(() => ({}))).error || 'rate limited');
     }
+    if (!res.ok) return;
+    const snap = await res.json();
+    // Check ordering after the body arrives: responses can finish parsing out of order
+    if (seq < lastAppliedTickSeq) return;
+    lastAppliedTickSeq = seq;
+    if (!snap.joined && isJoined && playerName) {
+      // Timed out server-side (or server restarted): join again, once, however many ticks notice it
+      rejoinInFlight ??= joinArena(playerName, selectedCharId)
+        .catch((err) => console.warn('Gilded Brawl rejoin failed:', err.message))
+        .finally(() => {
+          rejoinInFlight = null;
+        });
+      return;
+    }
+    applySnapshot(snap, false);
   } catch {
     // Transient network hiccup — next tick will recover
   }
@@ -647,7 +655,7 @@ async function syncWithServer() {
   syncInFlight = true;
   try {
     if (!isJoined) {
-      const res = await fetch(`/api/status?clientId=${encodeURIComponent(CLIENT_ID)}&since=${lastEventId}`);
+      const res = await fetch(`/api/status?since=${lastEventId}`);
       if (res.ok) applySnapshot(await res.json(), false);
       return;
     }
@@ -676,7 +684,8 @@ function pushKillToast(text) {
 
 function applySnapshot(snap, snapImmediate) {
   latestWorld = snap;
-  if (snap.lastEventId) lastEventId = snap.lastEventId;
+  selfId = snap.selfId;
+  if (Number.isFinite(snap.lastEventId)) lastEventId = snap.lastEventId;
 
   // Reconcile players
   const seen = new Set();
@@ -685,11 +694,11 @@ function applySnapshot(snap, snapImmediate) {
     const existing = renderPlayers.get(sp.id);
     if (!existing || snapImmediate) {
       renderPlayers.set(sp.id, { ...sp, tx: sp.x, ty: sp.y });
-      if (sp.id === CLIENT_ID) lastForcedSeq = sp.fseq || 1;
+      if (sp.id === selfId) lastForcedSeq = sp.fseq || 1;
     } else {
       existing.tx = sp.x;
       existing.ty = sp.y;
-      if (sp.id !== CLIENT_ID) {
+      if (sp.id !== selfId) {
         existing.aim = sp.aim;
         existing.moving = sp.moving;
       }
@@ -709,7 +718,7 @@ function applySnapshot(snap, snapImmediate) {
       existing.cds = sp.cds;
       existing.force = sp.force;
 
-      if (sp.id === CLIENT_ID) {
+      if (sp.id === selfId) {
         if (sp.cds) {
           // Keep optimistic cooldown if a cast was just sent so CD bar never flickers back to 0
           for (const k of ['basic', 's0', 's1', 's2']) {
@@ -744,8 +753,9 @@ function applySnapshot(snap, snapImmediate) {
   if (Array.isArray(snap.projectiles)) {
     for (const pr of snap.projectiles) {
       seenProj.add(pr.id);
-      if (pr.ownerId === CLIENT_ID) {
-        // Remove any matching local predicted projectile so we don't draw double
+      const existing = renderProjectiles.get(pr.id);
+      if (!existing && pr.ownerId === selfId) {
+        // A newly confirmed own projectile replaces its local prediction so we don't draw double
         for (const [lid, lpr] of renderProjectiles.entries()) {
           if (lpr.local && lpr.c === pr.c) {
             renderProjectiles.delete(lid);
@@ -753,7 +763,6 @@ function applySnapshot(snap, snapImmediate) {
           }
         }
       }
-      const existing = renderProjectiles.get(pr.id);
       if (!existing) {
         renderProjectiles.set(pr.id, { ...pr });
       } else {
@@ -776,7 +785,7 @@ function applySnapshot(snap, snapImmediate) {
   if (Array.isArray(snap.events)) {
     for (const evt of snap.events) {
       const selfPredicted =
-        evt.actorId === CLIENT_ID &&
+        evt.actorId === selfId &&
         (evt.type === 'slash' ||
           evt.type === 'nova' ||
           evt.type === 'beam' ||
@@ -792,9 +801,9 @@ function applySnapshot(snap, snapImmediate) {
         sfx.play('round_end');
       } else if (evt.type === 'round_start') {
         sfx.play('round_start');
-      } else if (evt.type === 'hit' && (evt.attackerId === CLIENT_ID || evt.targetId === CLIENT_ID)) {
+      } else if (evt.type === 'hit' && (evt.attackerId === selfId || evt.targetId === selfId)) {
         sfx.play('hit');
-      } else if (evt.type === 'heal' && evt.targetId === CLIENT_ID) {
+      } else if (evt.type === 'heal' && evt.targetId === selfId) {
         sfx.play('heal');
       } else if (evt.type === 'slash' || evt.type === 'nova' || evt.type === 'blast' || evt.type === 'beam' || evt.type === 'lightning' || evt.type === 'dash') {
         sfx.play(evt.type);
@@ -818,7 +827,7 @@ function updateHud(snap) {
   hudTimer.classList.toggle('urgent', snap.phase === 'playing' && snap.timeLeft <= 15);
   hudPlayers.textContent = `${snap.playerCount} ${snap.playerCount === 1 ? 'player' : 'players'}`;
 
-  const me = snap.players.find((p) => p.id === CLIENT_ID);
+  const me = snap.players.find((p) => p.id === selfId);
   if (me) {
     const biomeId = getBiomeAt(me.x, me.y);
     const biomeObj = Object.values(BIOMES).find((b) => b.id === biomeId);
@@ -844,7 +853,7 @@ function updateHud(snap) {
     .map((row, idx) => {
       const cls = [
         'lb-row',
-        row.id === CLIENT_ID ? 'is-self' : '',
+        row.id === selfId ? 'is-self' : '',
         !row.online ? 'is-offline' : '',
       ]
         .filter(Boolean)
@@ -928,7 +937,7 @@ function frame(now) {
     if (p.orbit !== null && p.orbit !== undefined) {
       p.orbit += dt * 5.2;
     }
-    if (p.id === CLIENT_ID && isJoined && p.alive) {
+    if (p.id === selfId && isJoined && p.alive) {
       if (liveAimWorld) {
         p.aim = Math.atan2(liveAimWorld.y - p.y, liveAimWorld.x - p.x);
       }
@@ -936,7 +945,7 @@ function frame(now) {
         const ch = CHARACTER_MAP[p.charId] || CHARACTERS[0];
         if (mvLen > 0.01) {
           const sp = ch.speed * (p.slow ? 0.56 : 1) * (p.haste ? 1.38 : 1);
-          const next = resolveLocalObstacles(
+          const next = resolveCircleObstacles(
             p.x + (ix / mvLen) * sp * dt,
             p.y + (iy / mvLen) * sp * dt,
             ch.radius
@@ -980,7 +989,7 @@ function frame(now) {
   }
 
   renderer.updateFx(dt);
-  renderer.render(latestWorld, CLIENT_ID, renderPlayers, renderProjectiles, now / 1000, dt, liveAimWorld);
+  renderer.render(latestWorld, selfId, renderPlayers, renderProjectiles, now / 1000, dt, liveAimWorld);
 
   requestAnimationFrame(frame);
 }

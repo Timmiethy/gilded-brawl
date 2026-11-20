@@ -422,12 +422,14 @@ body {
 }
 
 .hp-fill {
+  width: 100%;
   height: 100%;
   background: linear-gradient(90deg, #43a047, #81c784);
   transition: width 0.09s linear;
 }
 
 .shield-fill {
+  width: 0%;
   position: absolute;
   top: 0;
   left: 0;
@@ -826,6 +828,21 @@ dialog[open]:where(:not([data-closing]))::backdrop {
 
 #player-name-input:is(:user-invalid, .user-invalid-fallback) + .error-msg {
   display: block;
+}
+
+/* Server-side join refusal (arena full, network cap, rate limit) */
+.join-error {
+  margin: 8px 0 0;
+  padding: 8px 12px;
+  border: 1px solid rgba(255, 138, 128, 0.5);
+  border-radius: 6px;
+  background: rgba(255, 82, 82, 0.1);
+  color: #ff8a80;
+  font-size: 13px;
+}
+
+.join-error[hidden] {
+  display: none;
 }
 
 /* Roster & Hero Preview */
