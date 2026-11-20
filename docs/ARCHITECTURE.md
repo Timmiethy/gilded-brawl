@@ -13,7 +13,7 @@ Players roam a seamless `2400 × 2400` open-world map divided into 4 distinct bi
 ```text
 Browser Client (60 FPS)                       Node.js / Vercel Server (RAM)
 ┌──────────────────────────────────┐          ┌──────────────────────────────────┐
-│ WASD / Mouse / J-K-L Input       │          │ api/game.js                      │
+│ WASD / Mouse / Q-E-R Input       │          │ api/game.js                      │
 │  ├─ Instant 0ms local movement   │          │  ├─ Per-IP sliding rate limiter  │
 │  │  (resolveLocalObstacles)      │  POST    │  ├─ 4 KB body & schema guards    │
 │  ├─ Instant 0ms skill prediction │ /api/tick│  └─ Routes /join /tick /leave    │
@@ -30,7 +30,7 @@ Browser Client (60 FPS)                       Node.js / Vercel Server (RAM)
 ### Networking & Smoothness Model
 - **Client identity:** Each browser tab generates a unique `clientId` stored in `sessionStorage`, so every open tab is treated as an independent player.
 - **60 FPS movement without rubber-banding:** The client moves the local hero at 60 FPS using the shared obstacle layout (`resolveLocalObstacles`) and reports `(cx, cy)` on `/api/tick`. The server validates movement against `player.speed * speedMult * dt + tolerance` and obstacle collisions, and only forces position overrides (`fseq` / `force`) for server-authoritative displacements (dashes, blinks, hooks, knockbacks, gravity wells, respawns, new rounds).
-- **0ms skill & click responsiveness:** Clicking or pressing `J`/`K`/`L` immediately runs `predictActionLocally()` (spawning local VFX, SFX, cooldown sweep, and predicted projectiles) and fires a non-blocking `POST /api/tick` without waiting behind background 70ms polling ticks. Monotonic `tickSeq` numbering discards stale out-of-order responses, and server events tagged with `actorId` avoid duplicating locally predicted VFX.
+- **0ms skill & click responsiveness:** Clicking or pressing `Q`/`E`/`R` immediately runs `predictActionLocally()` (spawning local VFX, SFX, cooldown sweep, and predicted projectiles) and fires a non-blocking `POST /api/tick` without waiting behind background 70ms polling ticks. Monotonic `tickSeq` numbering discards stale out-of-order responses, and server events tagged with `actorId` avoid duplicating locally predicted VFX.
 - **Vercel serverless compatibility:** Because the entire simulation advances via wall-clock delta-time inside `stepEngine(Date.now())` on every incoming request (in addition to a 30 Hz local `setInterval` in `server.js`), round timers, projectiles, DoT zones, and delayed blasts stay accurate in both local Node and Vercel Node.js runtimes.
 
 ---
@@ -47,7 +47,7 @@ Browser Client (60 FPS)                       Node.js / Vercel Server (RAM)
 4. **Next Round (`startNextRound`):** Automatically resets HP, cooldowns, shrines, totems, and spawn positions while preserving the Champions wins leaderboard in RAM.
 
 ### 10 Playable Champions & Ability Archetypes
-Every character has 1 normal attack (`CLICK`) and 3 skills (`J`, `K`, `L`) built on a data-driven combat engine supporting 12 skill archetypes:
+Every character has 1 normal attack (`CLICK`) and 3 skills (`Q`, `E`, `R`) built on a data-driven combat engine supporting 12 skill archetypes:
 - **Tibo** (*Bruiser*, 130 HP): Potato Toss, Pack Rush (`dash_strike`), Hound Whistle (`orbit_hounds`), Gilded Slam (`nova`).
 - **Poteto** (*Brawler*, 145 HP): Mallet Swing (`melee`), Rolling Cask (`explosive_proj`), Starch Nova (`nova`), Grand Hammerfall (`cone_slam`).
 - **Biscuit** (*Pyromancer*, 110 HP): Cinder Bolt (`projectile`), Flame Fan (`spread_proj`), Scorch Puddle (`zone`), Solar Bark (`nova` + speed buff).
@@ -79,7 +79,7 @@ Every character has 1 normal attack (`CLICK`) and 3 skills (`J`, `K`, `L`) built
 ### Frontend Client
 - **[`public/index.html`](../public/index.html):** Semantic HTML document containing the full-viewport game `<canvas>`, HUD plates (round timer, biome, Champions leaderboard, kill feed, minimap, HP/shield bar, 4-slot skill bar), round summary overlay, and native `<dialog>` onboarding/hero-select modal.
 - **[`public/css/style.css`](../public/css/style.css):** Gilded gothic pixel-UI stylesheet (`Cinzel`/`Marcellus` + monospace `tabular-nums`), top-layer `<dialog>` entrance/exit transitions (`@starting-style`, `transition-behavior: allow-discrete`, staggered hero card reveals), `:user-invalid`/`:user-valid` name validation styling, and cooldown sweep animations.
-- **[`public/js/main.js`](../public/js/main.js):** Client controller — `sessionStorage` player identity, onboarding modal & accessible ARIA validation sync, physical `e.code` (`WASD` + `J`/`K`/`L`) & pointer input handlers, 0ms local action/movement prediction, non-blocking `/api/tick` dispatch, remote player/projectile interpolation, and 60 FPS `requestAnimationFrame` loop.
+- **[`public/js/main.js`](../public/js/main.js):** Client controller — `sessionStorage` player identity, onboarding modal & accessible ARIA validation sync, physical `e.code` (`WASD` + `Q`/`E`/`R`) & pointer input handlers, 0ms local action/movement prediction, non-blocking `/api/tick` dispatch, remote player/projectile interpolation, and 60 FPS `requestAnimationFrame` loop.
 - **[`public/js/renderer.js`](../public/js/renderer.js):** 2.5D Canvas renderer — biome ground tiles & courtyard sigils, Y-sorted 2.5D obstacles/shrines/totems/players with elliptical ground shadows, directional aim chevron, leader crowns, melee cleave wedges, double-ring novas, chains, lightning arcs, laser beams, particles, floating damage numbers, screen shake, and minimap.
 - **[`public/js/sprites.js`](../public/js/sprites.js):** Procedural 16×16 pixel-art sprite generator producing crisp offscreen canvases (idle, 2-frame walk cycle, white hit-flash, and onboarding portrait data URLs) for all 10 champions.
 - **[`public/js/audio.js`](../public/js/audio.js):** Lightweight procedural Web Audio API 16-bit synthesizer for attack, skill, hit, heal, KO, and round-horn sound effects with mute toggle.

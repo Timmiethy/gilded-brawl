@@ -538,15 +538,15 @@ window.addEventListener('keydown', (e) => {
 
   if (e.repeat) return;
 
-  if (code === 'KeyJ') {
+  if (code === 'KeyQ') {
     e.preventDefault();
     sfx.unlock();
     queueAction('skill0');
-  } else if (code === 'KeyK') {
+  } else if (code === 'KeyE') {
     e.preventDefault();
     sfx.unlock();
     queueAction('skill1');
-  } else if (code === 'KeyL') {
+  } else if (code === 'KeyR') {
     e.preventDefault();
     sfx.unlock();
     queueAction('skill2');

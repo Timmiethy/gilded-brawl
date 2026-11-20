@@ -27,7 +27,7 @@ export const CHARACTERS = [
     },
     skills: [
       {
-        key: 'J',
+        key: 'Q',
         name: 'Pack Rush',
         desc: 'Dash forward, dealing 18 dmg & knockback to foes in your path.',
         cooldown: 4.5,
@@ -39,7 +39,7 @@ export const CHARACTERS = [
         color: '#ffe082',
       },
       {
-        key: 'K',
+        key: 'E',
         name: 'Hound Whistle',
         desc: 'Summon 2 spectral hounds that orbit & bite nearby foes (9 dmg/hit, 4.5s).',
         cooldown: 8.5,
@@ -50,7 +50,7 @@ export const CHARACTERS = [
         color: '#fff59d',
       },
       {
-        key: 'L',
+        key: 'R',
         name: 'Gilded Slam',
         desc: 'Shockwave slam around you for 28 dmg + brief slow.',
         cooldown: 10.0,
@@ -89,7 +89,7 @@ export const CHARACTERS = [
     },
     skills: [
       {
-        key: 'J',
+        key: 'Q',
         name: 'Rolling Cask',
         desc: 'Launches an oak barrel that explodes for 24 dmg & heavy knockback.',
         cooldown: 5.5,
@@ -103,7 +103,7 @@ export const CHARACTERS = [
         color: '#b9843d',
       },
       {
-        key: 'K',
+        key: 'E',
         name: 'Starch Nova',
         desc: 'Sticky alchemical ring for 16 dmg that heavily slows foes for 2.2s.',
         cooldown: 7.5,
@@ -114,7 +114,7 @@ export const CHARACTERS = [
         color: '#ffab91',
       },
       {
-        key: 'L',
+        key: 'R',
         name: 'Grand Hammerfall',
         desc: 'Crushing crimson smash ahead for 34 dmg & huge knockback.',
         cooldown: 11.0,
@@ -153,7 +153,7 @@ export const CHARACTERS = [
     },
     skills: [
       {
-        key: 'J',
+        key: 'Q',
         name: 'Flame Fan',
         desc: 'Fires 5 blazing bolts in a spread cone (10 dmg each).',
         cooldown: 5.0,
@@ -167,7 +167,7 @@ export const CHARACTERS = [
         color: '#ff9800',
       },
       {
-        key: 'K',
+        key: 'E',
         name: 'Scorch Puddle',
         desc: 'Drops a molten lava zone at cursor dealing 8 dmg/tick for 3.6s.',
         cooldown: 8.0,
@@ -180,7 +180,7 @@ export const CHARACTERS = [
         color: '#ff5722',
       },
       {
-        key: 'L',
+        key: 'R',
         name: 'Solar Bark',
         desc: 'Blazing radial burst for 26 dmg + 2.5s speed surge.',
         cooldown: 10.5,
@@ -219,7 +219,7 @@ export const CHARACTERS = [
     },
     skills: [
       {
-        key: 'J',
+        key: 'Q',
         name: 'Aegis Bulwark',
         desc: 'Gain a 40 HP gilded barrier for 4s and pulse 12 dmg nearby.',
         cooldown: 8.5,
@@ -231,7 +231,7 @@ export const CHARACTERS = [
         color: '#ffe082',
       },
       {
-        key: 'K',
+        key: 'E',
         name: 'Chain Hook',
         desc: 'Fires an iron chain for 16 dmg that yanks the target toward you.',
         cooldown: 6.5,
@@ -243,7 +243,7 @@ export const CHARACTERS = [
         color: '#b0bec5',
       },
       {
-        key: 'L',
+        key: 'R',
         name: 'Bastion Quake',
         desc: 'Seismic shield slam for 30 dmg & heavy slow in a wide ring.',
         cooldown: 11.0,
@@ -282,7 +282,7 @@ export const CHARACTERS = [
     },
     skills: [
       {
-        key: 'J',
+        key: 'Q',
         name: 'Shadowstep',
         desc: 'Blink instantly toward cursor and slash foes on arrival for 20 dmg.',
         cooldown: 4.5,
@@ -293,7 +293,7 @@ export const CHARACTERS = [
         color: '#ba68c8',
       },
       {
-        key: 'K',
+        key: 'E',
         name: 'Eclipse Kunai',
         desc: 'Throws 3 piercing shadow blades (12 dmg each).',
         cooldown: 5.5,
@@ -308,7 +308,7 @@ export const CHARACTERS = [
         color: '#ab47bc',
       },
       {
-        key: 'L',
+        key: 'R',
         name: 'Phantom Flurry',
         desc: 'Whirling eclipse blades deal 32 burst dmg around Nyx.',
         cooldown: 9.5,
@@ -347,7 +347,7 @@ export const CHARACTERS = [
     },
     skills: [
       {
-        key: 'J',
+        key: 'Q',
         name: 'Glacier Wave',
         desc: 'Fires 3 wide frost bolts for 15 dmg + 2s chill slow.',
         cooldown: 5.5,
@@ -362,7 +362,7 @@ export const CHARACTERS = [
         color: '#4fc3f7',
       },
       {
-        key: 'K',
+        key: 'E',
         name: 'Blizzard Ring',
         desc: 'Swirling hailstorm at cursor dealing 7 dmg/tick & chilling for 3.6s.',
         cooldown: 8.5,
@@ -376,7 +376,7 @@ export const CHARACTERS = [
         color: '#64b5f6',
       },
       {
-        key: 'L',
+        key: 'R',
         name: 'Absolute Bark',
         desc: 'Shatters frost in a huge ring for 26 dmg + deep freeze slow.',
         cooldown: 10.5,
@@ -416,7 +416,7 @@ export const CHARACTERS = [
     },
     skills: [
       {
-        key: 'J',
+        key: 'Q',
         name: 'Bat Swarm',
         desc: 'Fires 3 crimson bats (11 dmg each, heals 4 HP per hit).',
         cooldown: 5.5,
@@ -431,7 +431,7 @@ export const CHARACTERS = [
         color: '#e53935',
       },
       {
-        key: 'K',
+        key: 'E',
         name: 'Blood Mist',
         desc: 'Surge forward as crimson mist for 16 dmg + 2s speed boost.',
         cooldown: 6.5,
@@ -443,7 +443,7 @@ export const CHARACTERS = [
         color: '#c62828',
       },
       {
-        key: 'L',
+        key: 'R',
         name: 'Sanguine Feast',
         desc: 'Crimson nova deals 24 dmg and heals Baron 12 HP per foe struck.',
         cooldown: 11.5,
@@ -482,7 +482,7 @@ export const CHARACTERS = [
     },
     skills: [
       {
-        key: 'J',
+        key: 'Q',
         name: 'Chain Lightning',
         desc: 'Instant bolt dealing 20 dmg and arcing to nearby enemies.',
         cooldown: 5.5,
@@ -493,7 +493,7 @@ export const CHARACTERS = [
         color: '#ffee58',
       },
       {
-        key: 'K',
+        key: 'E',
         name: 'Tesla Pylon',
         desc: 'Deploy a shock pylon at cursor that zaps foes (10 dmg/s for 5.5s).',
         cooldown: 9.5,
@@ -506,7 +506,7 @@ export const CHARACTERS = [
         color: '#40c4ff',
       },
       {
-        key: 'L',
+        key: 'R',
         name: 'Thunderstrike',
         desc: 'Calls a massive lightning bolt at cursor for 34 burst dmg.',
         cooldown: 10.5,
@@ -545,7 +545,7 @@ export const CHARACTERS = [
     },
     skills: [
       {
-        key: 'J',
+        key: 'Q',
         name: 'Bramble Snare',
         desc: 'Erupts thorny roots at cursor for 18 dmg & heavy 2.4s slow.',
         cooldown: 6.0,
@@ -558,7 +558,7 @@ export const CHARACTERS = [
         color: '#66bb6a',
       },
       {
-        key: 'K',
+        key: 'E',
         name: 'Verdant Bloom',
         desc: 'Restores 22 HP to Moss and releases a 14 dmg pollen burst.',
         cooldown: 9.5,
@@ -569,7 +569,7 @@ export const CHARACTERS = [
         color: '#a5d6a7',
       },
       {
-        key: 'L',
+        key: 'R',
         name: 'Razor Volley',
         desc: 'Sweeping fan of 7 piercing thorns (12 dmg each).',
         cooldown: 9.5,
@@ -612,7 +612,7 @@ export const CHARACTERS = [
     },
     skills: [
       {
-        key: 'J',
+        key: 'Q',
         name: 'Gravity Well',
         desc: 'Cosmic vortex at cursor pulls foes inward & deals 8 dmg/tick (3.2s).',
         cooldown: 8.0,
@@ -626,7 +626,7 @@ export const CHARACTERS = [
         color: '#7c4dff',
       },
       {
-        key: 'K',
+        key: 'E',
         name: 'Comet Drop',
         desc: 'Calls down a blazing meteor at cursor for 28 dmg & knockback.',
         cooldown: 6.5,
@@ -639,7 +639,7 @@ export const CHARACTERS = [
         color: '#ffd54f',
       },
       {
-        key: 'L',
+        key: 'R',
         name: 'Supernova Beam',
         desc: 'Fires an instant piercing gilded-arcane laser for 32 dmg.',
         cooldown: 10.5,

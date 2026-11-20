@@ -19,7 +19,7 @@ npm start
 | `W` `A` `S` `D` (or Arrow keys) | Move (uses physical `e.code`, works across all keyboard layouts/IMEs) |
 | Mouse Move | Aim |
 | Left Click | Normal Attack (hold to auto-fire) |
-| `J` / `K` / `L` | Special Skills 1 / 2 / 3 |
+| `Q` / `E` / `R` | Special Skills 1 / 2 / 3 |
 
 ## Round Rules
 
