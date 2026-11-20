@@ -2,8 +2,8 @@
 import { CHARACTERS, CHARACTER_MAP } from '/shared/characters.js';
 import { getBiomeAt, BIOMES } from '/shared/map.js';
 import { resolveCircleObstacles, dashDistance, traceDash } from '/shared/physics.js';
-import { getHeroSprites } from './sprites.js';
-import { ArenaRenderer } from './renderer.js';
+import { ArenaRenderer } from './render/renderer.js';
+import { getHeroPortrait } from './render/heroes.js';
 import { sfx } from './audio.js';
 
 // Each browser tab holds a secret session key (a bearer credential — never shown to other players).
@@ -187,7 +187,6 @@ dialogEl.addEventListener('cancel', (e) => {
 function renderRoster() {
   charGridEl.innerHTML = '';
   CHARACTERS.forEach((ch, idx) => {
-    const sp = getHeroSprites(ch.id);
     const btn = document.createElement('button');
     btn.type = 'button';
     btn.className = 'char-card';
@@ -196,7 +195,7 @@ function renderRoster() {
     btn.setAttribute('aria-checked', ch.id === selectedCharId ? 'true' : 'false');
     btn.dataset.charId = ch.id;
     btn.innerHTML = `
-      <img src="${sp.portrait}" alt="${ch.name}" width="40" height="40" />
+      <img src="${getHeroPortrait(ch.id)}" alt="${ch.name}" width="40" height="40" />
       <div>
         <div class="char-card-name">${ch.name}</div>
         <div class="char-card-role">${ch.role} · ${ch.hp} HP</div>
@@ -218,8 +217,7 @@ function updateRosterSelection() {
     card.setAttribute('aria-checked', card.dataset.charId === selectedCharId ? 'true' : 'false');
   }
   const ch = CHARACTER_MAP[selectedCharId] || CHARACTERS[0];
-  const sp = getHeroSprites(ch.id);
-  document.getElementById('preview-portrait').src = sp.portrait;
+  document.getElementById('preview-portrait').src = getHeroPortrait(ch.id);
   document.getElementById('preview-role').textContent = ch.role;
   document.getElementById('preview-name').textContent = ch.name;
   document.getElementById('preview-title').textContent = ch.title;
@@ -275,8 +273,7 @@ async function joinArena(name, charId) {
 
 function updateHeroHudStatic() {
   const ch = CHARACTER_MAP[selectedCharId] || CHARACTERS[0];
-  const sp = getHeroSprites(ch.id);
-  hudPortrait.src = sp.portrait;
+  hudPortrait.src = getHeroPortrait(ch.id);
   hudHeroName.textContent = ch.name;
   hudPlayerName.textContent = playerName;
   document.getElementById('slot-basic-name').textContent = ch.basic.name;
@@ -357,6 +354,8 @@ function predictActionLocally(actionKey, aimWorld) {
   const skillIdx = actionKey === 'skill0' ? 0 : actionKey === 'skill1' ? 1 : actionKey === 'skill2' ? 2 : -1;
   const def = isBasic ? ch.basic : ch.skills[skillIdx];
   if (!def) return;
+  // The server refuses skills while silenced; predicting them would flash a cast that never happens
+  if (!isBasic && me.silenced) return;
 
   const cdKey = isBasic ? 'basic' : `s${skillIdx}`;
   localCds[cdKey] = def.cooldown;
@@ -374,9 +373,7 @@ function predictActionLocally(actionKey, aimWorld) {
   const dist = Math.hypot(dx, dy);
 
   switch (def.type) {
-    case 'projectile':
-    case 'explosive_proj':
-    case 'hook': {
+    case 'projectile': {
       const id = `loc_${localProjSeq++}`;
       renderProjectiles.set(id, {
         id,
@@ -388,9 +385,9 @@ function predictActionLocally(actionKey, aimWorld) {
         vy: dirY * def.speed,
         r: def.radius || 8,
         c: def.color,
-        k: def.type,
-        ox: me.x,
-        oy: me.y,
+        k: def.visual || 'orb',
+        ox: def.onHit === 'hook' || def.onHit === 'grapple' ? me.x : undefined,
+        oy: def.onHit === 'hook' || def.onHit === 'grapple' ? me.y : undefined,
         life: Math.min(0.9, def.range / def.speed),
       });
       sfx.play(isBasic ? 'shoot' : 'spread');
@@ -415,7 +412,7 @@ function predictActionLocally(actionKey, aimWorld) {
           vy: cy * def.speed,
           r: def.radius || 7,
           c: def.color,
-          k: 'projectile',
+          k: def.visual || 'orb',
           life: Math.min(0.9, def.range / def.speed),
         });
       }
@@ -437,11 +434,10 @@ function predictActionLocally(actionKey, aimWorld) {
       sfx.play('slash');
       break;
     }
-    case 'dash_strike':
-    case 'blink_strike': {
+    case 'dash_strike': {
       const sx = me.x;
       const sy = me.y;
-      const { end: dest } = traceDash(def.type, sx, sy, dirX, dirY, dashDistance(def, dist), ch.radius);
+      const { end: dest } = traceDash(sx, sy, dirX, dirY, dashDistance(def, dist), ch.radius);
       me.x = dest.x;
       me.y = dest.y;
       lastLocalDashAt = performance.now();
@@ -449,7 +445,6 @@ function predictActionLocally(actionKey, aimWorld) {
       sfx.play('dash');
       break;
     }
-    case 'nova':
     case 'shield_pulse':
     case 'heal_nova': {
       renderer.pushEventFx({ type: 'nova', x: me.x, y: me.y, r: def.radius || 140, color: def.color });
@@ -479,9 +474,29 @@ function predictActionLocally(actionKey, aimWorld) {
       sfx.play('lightning');
       break;
     }
-    case 'orbit_hounds':
-      me.orbit = me.orbit || 0;
-      sfx.play('heal');
+    case 'ripple':
+      renderer.pushEventFx({ type: 'ripple', x: me.x, y: me.y, r: def.radius, duration: def.duration, color: def.color });
+      sfx.play('ripple');
+      break;
+    // Server-authoritative moves (teleports, stealth, lock-ons): the server event draws them
+    case 'orbit':
+    case 'trail':
+      sfx.play('skill');
+      break;
+    case 'stealth':
+      sfx.play('stealth');
+      break;
+    case 'rewind':
+      sfx.play('rewind');
+      break;
+    case 'portal':
+      sfx.play('portal');
+      break;
+    case 'blink_chain':
+      sfx.play('dash');
+      break;
+    case 'deadeye':
+      sfx.play('tracer');
       break;
     default: {
       const clamped = Math.min(dist, def.range || 360);
@@ -562,14 +577,14 @@ window.addEventListener('blur', () => {
 window.addEventListener('pointermove', (e) => {
   mouseScreen.x = e.clientX;
   mouseScreen.y = e.clientY;
-  if (!e.target || !e.target.closest('button, input, dialog')) {
+  if (!e.target?.closest?.('button, input, dialog')) {
     lastArenaAimWorld = renderer.screenToWorld(e.clientX, e.clientY);
   }
 });
 
 window.addEventListener('pointerdown', (e) => {
   if (e.button !== 0 || dialogEl.open || !isJoined) return;
-  if (e.target && e.target.closest('button, input, dialog')) return;
+  if (e.target?.closest?.('button, input, dialog')) return;
   sfx.unlock();
   mouseDown = true;
   mouseScreen.x = e.clientX;
@@ -673,6 +688,24 @@ async function syncWithServer() {
   }
 }
 
+const calloutEl = document.getElementById('callout');
+function showCallout(main, sub = '', variant = '') {
+  const card = document.createElement('div');
+  card.className = `callout-card${variant ? ` is-${variant}` : ''}`;
+  const m = document.createElement('span');
+  m.className = 'callout-main';
+  m.textContent = main;
+  card.append(m);
+  if (sub) {
+    const s = document.createElement('span');
+    s.className = 'callout-sub';
+    s.textContent = sub;
+    card.append(s);
+  }
+  calloutEl.replaceChildren(card);
+  card.addEventListener('animationend', () => card.remove());
+}
+
 function pushKillToast(text) {
   const el = document.createElement('div');
   el.className = 'kill-toast';
@@ -713,6 +746,11 @@ function applySnapshot(snap, snapImmediate) {
       existing.atk = sp.atk;
       existing.orbit = sp.orbit;
       existing.orbitR = sp.orbitR;
+      existing.orbitN = sp.orbitN;
+      existing.orbitC = sp.orbitC;
+      existing.silenced = sp.silenced;
+      existing.stealth = sp.stealth;
+      existing.trail = sp.trail;
       existing.charId = sp.charId;
       existing.name = sp.name;
       existing.cds = sp.cds;
@@ -770,9 +808,13 @@ function applySnapshot(snap, snapImmediate) {
         existing.vy = pr.vy;
         existing.ox = pr.ox;
         existing.oy = pr.oy;
+        // Homing, ricochet and boomerang shots turn between snapshots: ease toward the server position
         if (Math.hypot(existing.x - pr.x, existing.y - pr.y) > 95) {
           existing.x = pr.x;
           existing.y = pr.y;
+        } else {
+          existing.x += (pr.x - existing.x) * 0.5;
+          existing.y += (pr.y - existing.y) * 0.5;
         }
       }
     }
@@ -790,6 +832,7 @@ function applySnapshot(snap, snapImmediate) {
           evt.type === 'nova' ||
           evt.type === 'beam' ||
           evt.type === 'lightning' ||
+          evt.type === 'ripple' ||
           evt.type === 'dash');
       if (selfPredicted) continue;
 
@@ -797,15 +840,17 @@ function applySnapshot(snap, snapImmediate) {
       if (evt.type === 'ko') {
         pushKillToast(`☠ ${evt.attackerName} KO'd ${evt.victimName}`);
         sfx.play('ko');
+        if (evt.attackerId && evt.attackerId === selfId) showCallout('KNOCKOUT!', evt.victimName, 'ko');
       } else if (evt.type === 'round_end') {
         sfx.play('round_end');
       } else if (evt.type === 'round_start') {
         sfx.play('round_start');
+        showCallout(`ROUND ${evt.roundNumber}`, 'FIGHT!');
       } else if (evt.type === 'hit' && (evt.attackerId === selfId || evt.targetId === selfId)) {
         sfx.play('hit');
       } else if (evt.type === 'heal' && evt.targetId === selfId) {
         sfx.play('heal');
-      } else if (evt.type === 'slash' || evt.type === 'nova' || evt.type === 'blast' || evt.type === 'beam' || evt.type === 'lightning' || evt.type === 'dash') {
+      } else if (EVENT_SOUNDS.has(evt.type)) {
         sfx.play(evt.type);
       }
     }
@@ -813,6 +858,11 @@ function applySnapshot(snap, snapImmediate) {
 
   updateHud(snap);
 }
+
+const EVENT_SOUNDS = new Set([
+  'slash', 'nova', 'blast', 'beam', 'lightning', 'dash', 'ripple', 'portal', 'stealth', 'reveal',
+  'rewind', 'bounce', 'swap', 'tracer', 'cursed', 'blink_chain', 'respawn', 'fizzle',
+]);
 
 function formatTime(sec) {
   const s = Math.max(0, Math.ceil(sec));
@@ -839,6 +889,10 @@ function updateHud(snap) {
 
     respawnBanner.hidden = me.alive;
     if (!me.alive) respawnSec.textContent = me.respawn.toFixed(1);
+
+    for (const k of ['s0', 's1', 's2']) {
+      document.getElementById(`slot-${k}-cd`)?.parentElement.classList.toggle('is-silenced', !!me.silenced);
+    }
 
     if (me.cds) {
       updateCdSlot('basic', me.cds.basic);
@@ -905,6 +959,12 @@ function updateCdSlot(key, cd, maxCd = 1) {
   const cdEl = document.getElementById(`slot-${key}-cd`);
   const slotBtn = cdEl?.parentElement;
   if (!cdEl || !slotBtn) return;
+  if (cd <= 0.05 && slotBtn.classList.contains('on-cd')) {
+    // Restart the sweep animation each time this skill comes back
+    slotBtn.classList.remove('just-ready');
+    void slotBtn.offsetWidth;
+    slotBtn.classList.add('just-ready');
+  }
   if (cd > 0.05) {
     cdEl.textContent = cd.toFixed(1);
     slotBtn.classList.add('on-cd');
@@ -935,7 +995,7 @@ function frame(now) {
 
   for (const p of renderPlayers.values()) {
     if (p.orbit !== null && p.orbit !== undefined) {
-      p.orbit += dt * 5.2;
+      p.orbit += dt * 4.2; // matches the server's orbit angular speed
     }
     if (p.id === selfId && isJoined && p.alive) {
       if (liveAimWorld) {
@@ -988,7 +1048,6 @@ function frame(now) {
     }
   }
 
-  renderer.updateFx(dt);
   renderer.render(latestWorld, selfId, renderPlayers, renderProjectiles, now / 1000, dt, liveAimWorld);
 
   requestAnimationFrame(frame);

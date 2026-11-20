@@ -1,6 +1,6 @@
 # Gilded Brawl
 
-A 2.5D gilded pixel open-world PvP multiplayer browser arena inspired by [`tibo.dog`](https://tibo.dog/). Zero login — enter a name, pick from 10 unique champions, and jump straight into 90-second open-world PvP rounds.
+A 3D open-world PvP multiplayer browser arena (three.js / WebGL). Zero login — enter a name, pick one of 10 heroes (a clockwork wren, a lantern ghost, a cactus gunslinger, an origami ronin, a jellyfish astronomer, a pocket thundercloud, a teacup knight, a mushroom alchemist, a vending-machine golem, and a wandering lighthouse), and jump into 90-second PvP rounds.
 
 - **Live Game:** https://agile-krypton-nuen60z-timmiethys-projects.vercel.app
 - **Full Technical & Architecture Docs:** [docs/ARCHITECTURE.md](./docs/ARCHITECTURE.md)
@@ -11,6 +11,10 @@ A 2.5D gilded pixel open-world PvP multiplayer browser arena inspired by [`tibo.
 npm start
 # Open http://localhost:3000 (open multiple browser tabs to test PvP)
 ```
+
+Run `npm test` for the engine checks: every move of every hero, each mechanic (rewind, stealth, portals, ricochet, boomerang, homing, time bomb, stasis, barrier, trail, silence), and the anti-cheat regressions.
+
+three.js is vendored into `public/vendor/three/`. After you change its pinned version in `package.json`, run `npm install && npm run vendor:three`.
 
 ## Controls
 

@@ -3,10 +3,10 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
-    <title>GILDED BRAWL — 2.5D Pixel Open-World PvP Arena</title>
+    <title>GILDED BRAWL — 3D Open-World PvP Arena</title>
     <meta
       name="description"
-      content="A free 2.5D gilded pixel open-world PvP browser arena inspired by tibo.dog. Pick from 10 heroes, battle in 90-second rounds, and claim the crown."
+      content="A free 3D open-world PvP browser arena. Pick from 10 heroes, battle in 90-second rounds, and claim the crown."
     />
     <meta name="theme-color" content="#0a0c12" />
     <link rel="preconnect" href="https://fonts.googleapis.com" />
@@ -129,6 +129,9 @@
       </div>
 
       <!-- Round End / Intermission Banner -->
+      <!-- Animated center-screen callouts (round start, your knockouts) -->
+      <div id="callout" class="callout" aria-live="polite"></div>
+
       <section id="round-overlay" class="round-overlay" hidden aria-live="polite">
         <div class="gilded-plate round-summary-card">
           <div id="summary-kicker" class="kicker">ROUND 1 COMPLETE</div>
@@ -145,7 +148,7 @@
       <dialog id="onboarding-dialog" aria-labelledby="onboarding-title" closedby="none">
         <form id="onboarding-form" class="onboarding-shell" novalidate>
           <header class="onboarding-header">
-            <div class="title-crest">2.5D GILDED PIXEL PVP ARENA</div>
+            <div class="title-crest">3D OPEN-WORLD PVP ARENA</div>
             <h1 id="onboarding-title" class="game-logo">GILDED BRAWL</h1>
             <p class="onboarding-tagline">
               No login. Pick your name &amp; champion, battle for 1:30 — most kills wins (HP tiebreaker, ties share victory).

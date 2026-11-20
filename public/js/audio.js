@@ -87,6 +87,54 @@ class SoundEngine {
         tone('triangle', 330, 440, 0.12, 0.08, 0);
         tone('triangle', 440, 660, 0.22, 0.09, 0.1);
         break;
+      case 'ripple':
+        tone('sine', 180, 60, 0.5, 0.09);
+        tone('triangle', 900, 300, 0.4, 0.05, 0.02);
+        break;
+      case 'portal':
+        tone('sine', 300, 900, 0.3, 0.07);
+        tone('sine', 450, 1350, 0.3, 0.04, 0.05);
+        break;
+      case 'stealth':
+        tone('sine', 700, 160, 0.35, 0.06);
+        break;
+      case 'reveal':
+        tone('triangle', 500, 1000, 0.12, 0.05);
+        break;
+      case 'rewind':
+        tone('sawtooth', 900, 200, 0.18, 0.05);
+        tone('sawtooth', 700, 150, 0.18, 0.05, 0.12);
+        tone('sine', 220, 440, 0.25, 0.06, 0.24);
+        break;
+      case 'bounce':
+        tone('square', 1200, 600, 0.05, 0.035);
+        break;
+      case 'swap':
+        tone('sine', 400, 800, 0.15, 0.06);
+        tone('sine', 800, 400, 0.15, 0.06, 0.1);
+        break;
+      case 'tracer':
+        tone('square', 160, 50, 0.22, 0.1);
+        tone('sawtooth', 1400, 200, 0.12, 0.06);
+        break;
+      case 'cursed':
+        tone('square', 880, 880, 0.06, 0.05);
+        tone('square', 880, 880, 0.06, 0.05, 0.12);
+        break;
+      case 'blink_chain':
+        tone('sawtooth', 600, 1400, 0.1, 0.05);
+        tone('sawtooth', 700, 1600, 0.1, 0.05, 0.08);
+        tone('sawtooth', 800, 1800, 0.1, 0.05, 0.16);
+        break;
+      case 'respawn':
+        tone('triangle', 330, 660, 0.3, 0.06);
+        break;
+      case 'fizzle':
+        tone('sawtooth', 300, 80, 0.12, 0.04);
+        break;
+      case 'skill':
+        tone('triangle', 360, 720, 0.14, 0.06);
+        break;
       default:
         tone('triangle', 420, 260, 0.09, 0.05);
     }
